@@ -575,6 +575,15 @@
   line-height: 1.55;
 }
 
+.empty-note strong,
+.empty-note span {
+  display: block;
+}
+
+.empty-note span {
+  margin-top: 6px;
+}
+
 .sr-only {
   position: absolute;
   width: 1px;

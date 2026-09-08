@@ -1,44 +1,51 @@
-# [Project name]
+# Папа-бот
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Одностраничный тёплый чат для разговоров по персональной ссылке, где шестизначный код определяет отдельную историю.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `python artifacts/api-server/main.py` — run the FastAPI API server (port 8080)
+- `pnpm --filter @workspace/papa-bot run dev` — run the frontend
 - `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- `python -m py_compile artifacts/api-server/main.py` — check the FastAPI syntax
+- Configuration template: `artifacts/api-server/.env.example`
+- Sessions are stored in `data/sessions/` and are intentionally git-ignored.
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- pnpm workspace for the React/Vite frontend
+- API: Python 3.13, FastAPI, Uvicorn, HTTPX
+- LLM: OpenAI-compatible `/chat/completions` endpoint
+- Storage: one JSON file per six-character dialog code
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `artifacts/papa-bot/` — user-facing chat at `/dialog/<code>`
+- `artifacts/api-server/main.py` — FastAPI routes, session storage, and OpenAI client
+- `artifacts/api-server/.env.example` — non-secret configuration reference
+- `data/sessions/` — local JSON histories, one file per dialog code
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- The public identity is a six-character alphanumeric code, normalized to lowercase; there is no account or admin UI.
+- The frontend route is `/dialog/<code>` and the API is `/api/dialog/<code>`.
+- The OpenAI client uses configurable `OPENAI_BASE_URL`, so an OpenAI-compatible provider can be substituted without code changes.
+- Conversation histories are saved atomically as JSON files instead of using the unused database scaffold.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- A visitor opens a personal `/dialog/<code>` link.
+- The chat loads only that code's history and sends new messages to FastAPI.
+- The backend forwards the conversation to the configured OpenAI-compatible API and persists successful exchanges.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Do not add an admin dashboard or duplicate file-system monitoring in the app.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- `OPENAI_API_KEY` is required for sending messages; without it, the API intentionally returns a clear 503 instead of silently using mock replies.
+- Codes must be exactly six ASCII letters or digits. Uppercase links are treated as the same lowercase session.
 
 ## Pointers
 

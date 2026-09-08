@@ -10,7 +10,7 @@ import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
-import { Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
+import { Route, Switch, useLocation, useRoute, Router as WouterRouter } from 'wouter';
 
 type Role = 'assistant' | 'user';
 
@@ -23,26 +23,12 @@ type Message = {
 
 const queryClient = new QueryClient();
 
-const initialMessages: Message[] = [
-  {
-    id: 'welcome',
-    role: 'assistant',
-    text: 'Добрый вечер, папа. Рад тебя видеть. Как прошёл день?',
-    time: 'сегодня, 18:42',
-  },
-  {
-    id: 'returning',
-    role: 'user',
-    text: 'В целом хорошо. Только что смотрел старые фотографии.',
-    time: 'сегодня, 18:44',
-  },
-  {
-    id: 'reply',
-    role: 'assistant',
-    text: 'Это хорошие вещи — иногда один снимок может вернуть целый день. Кто там был?',
-    time: 'сегодня, 18:44',
-  },
-];
+type ApiMessage = {
+  id: string;
+  role: Role;
+  content: string;
+  created_at: string;
+};
 
 const starters = [
   'Расскажи что-нибудь интересное',
@@ -50,90 +36,134 @@ const starters = [
   'Помоги вспомнить название фильма',
 ];
 
-function currentTime() {
-  return new Intl.DateTimeFormat('ru-RU', {
+function formatMessageTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+
+  const today = new Date();
+  const isToday =
+    today.getFullYear() === date.getFullYear() &&
+    today.getMonth() === date.getMonth() &&
+    today.getDate() === date.getDate();
+  const time = new Intl.DateTimeFormat('ru-RU', {
     hour: '2-digit',
     minute: '2-digit',
-  }).format(new Date());
+  }).format(date);
+
+  if (isToday) return `сегодня, ${time}`;
+  return new Intl.DateTimeFormat('ru-RU', {
+    day: '2-digit',
+    month: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
 }
 
-function getMockReply(text: string) {
-  const normalized = text.toLocaleLowerCase('ru-RU');
-
-  if (normalized.includes('привет') || normalized.includes('здравств')) {
-    return 'Привет. Хорошо, что ты заглянул. Я рядом и внимательно слушаю.';
-  }
-  if (normalized.includes('погод')) {
-    return 'Сегодня за окном спокойно и свежо. Самое то для короткой прогулки или чашки чая у окна.';
-  }
-  if (normalized.includes('фильм') || normalized.includes('кино')) {
-    return 'Давай попробуем вспомнить вместе. Что запомнилось сильнее всего — сюжет, актёр или музыка?';
-  }
-  if (normalized.includes('как дела') || normalized.includes('как ты')) {
-    return 'У меня всё спокойно. А ты как сегодня — без подробностей, если не хочется.';
-  }
-  if (normalized.includes('спасибо')) {
-    return 'Пожалуйста. Мне приятно быть рядом в такие обычные минуты.';
-  }
-  return 'Понимаю тебя. Давай не спешить — расскажи столько, сколько сейчас хочется.';
+function fromApiMessages(messages: ApiMessage[]): Message[] {
+  return messages.map((message) => ({
+    id: message.id,
+    role: message.role,
+    text: message.content,
+    time: formatMessageTime(message.created_at),
+  }));
 }
 
 function Home() {
-  const [messages, setMessages] = useState<Message[]>(initialMessages);
+  const [, routeParams] = useRoute('/dialog/:code');
+  const code = (routeParams?.code ?? 'demo01').toLowerCase();
+  const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState('');
+  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
   const [isSending, setIsSending] = useState(false);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState('');
   const [lastFailedText, setLastFailedText] = useState('');
-  const replyTimer = useRef<number | null>(null);
+  const [reloadToken, setReloadToken] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    return () => {
-      if (replyTimer.current !== null) {
-        window.clearTimeout(replyTimer.current);
+    let cancelled = false;
+
+    const loadDialog = async () => {
+      setIsLoadingHistory(true);
+      setError('');
+      try {
+        const response = await fetch(`/api/dialog/${encodeURIComponent(code)}`);
+        const payload = (await response.json()) as
+          | { messages?: ApiMessage[]; detail?: string }
+          | undefined;
+        if (!response.ok) {
+          throw new Error(payload?.detail ?? 'Не удалось открыть разговор.');
+        }
+        if (!cancelled) {
+          setMessages(fromApiMessages(payload?.messages ?? []));
+        }
+      } catch (loadError) {
+        if (!cancelled) {
+          setError(
+            loadError instanceof Error
+              ? loadError.message
+              : 'Не удалось открыть разговор.',
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingHistory(false);
+        }
       }
     };
-  }, []);
 
-  const submitMessage = (rawText: string, isRetry = false) => {
+    void loadDialog();
+    return () => {
+      cancelled = true;
+    };
+  }, [code, reloadToken]);
+
+  const submitMessage = async (rawText: string, isRetry = false) => {
     const text = rawText.trim();
     if (!text || isSending) return;
 
-    setError(false);
+    setError('');
     if (!isRetry) {
       setMessages((current) => [
         ...current,
-        { id: `user-${Date.now()}`, role: 'user', text, time: currentTime() },
+        {
+          id: `pending-${Date.now()}`,
+          role: 'user',
+          text,
+          time: 'сейчас',
+        },
       ]);
       setDraft('');
     }
     textareaRef.current?.focus();
     setIsSending(true);
 
-    replyTimer.current = window.setTimeout(() => {
-      const shouldShowError =
-        !isRetry &&
-        (text.toLocaleLowerCase('ru-RU').includes('ошибка') ||
-          text.toLocaleLowerCase('ru-RU').includes('не отвечай'));
-
-      if (shouldShowError) {
-        setLastFailedText(text);
-        setIsSending(false);
-        setError(true);
-        return;
-      }
-
-      setMessages((current) => [
-        ...current,
+    try {
+      const response = await fetch(
+        `/api/dialog/${encodeURIComponent(code)}/messages`,
         {
-          id: `assistant-${Date.now()}`,
-          role: 'assistant',
-          text: getMockReply(text),
-          time: currentTime(),
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text }),
         },
-      ]);
+      );
+      const payload = (await response.json()) as
+        | { messages?: ApiMessage[]; detail?: string }
+        | undefined;
+      if (!response.ok) {
+        throw new Error(payload?.detail ?? 'Собеседник пока не отвечает.');
+      }
+      setMessages(fromApiMessages(payload?.messages ?? []));
+    } catch (sendError) {
+      setLastFailedText(text);
+      setError(
+        sendError instanceof Error
+          ? sendError.message
+          : 'Собеседник пока не отвечает.',
+      );
+    } finally {
       setIsSending(false);
-    }, 720);
+    }
   };
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -177,10 +207,15 @@ function Home() {
             </p>
 
             <div className="conversation-log" aria-live="polite" data-testid="conversation-log">
-              {messages.length === 0 && (
+              {isLoadingHistory && (
+                <div className="empty-note" data-testid="loading-conversation">
+                  Загружаю наш разговор...
+                </div>
+              )}
+              {!isLoadingHistory && messages.length === 0 && (
                 <div className="empty-note" data-testid="empty-conversation">
-                  Здесь пока тихо. Напиши первую мысль — разговор сам найдёт
-                  дорогу.
+                  <strong>Добрый вечер, папа.</strong>
+                  <span>Рад тебя видеть. Как прошёл день?</span>
                 </div>
               )}
               {messages.map((message) => (
@@ -216,10 +251,16 @@ function Home() {
               {error && (
                 <div className="error-card" role="alert" data-testid="status-error">
                   <LifeBuoy size={17} strokeWidth={1.8} aria-hidden="true" />
-                  <span>Кажется, мысль не дошла. Ничего, можно попробовать ещё раз.</span>
+                  <span>{error}</span>
                   <button
                     type="button"
-                    onClick={() => submitMessage(lastFailedText, true)}
+                    onClick={() => {
+                      if (lastFailedText) {
+                        void submitMessage(lastFailedText, true);
+                      } else {
+                        setReloadToken((value) => value + 1);
+                      }
+                    }}
                     data-testid="button-retry"
                   >
                     Повторить
@@ -311,6 +352,7 @@ function Router() {
   return (
     <RoutedErrorBoundary>
       <Switch>
+        <Route path="/dialog/:code" component={Home} />
         <Route path="/" component={Home} />
         <Route component={NotFound} />
       </Switch>
