@@ -3,8 +3,10 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import {
   CloudSun,
   LifeBuoy,
+  Plus,
   Send,
   Sparkles,
+  X,
 } from 'lucide-react';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
@@ -12,7 +14,7 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
 import { Route, Switch, useLocation, useRoute, Router as WouterRouter } from 'wouter';
 
-type Role = 'assistant' | 'user';
+type Role = 'assistant' | 'user' | 'system';
 
 type Message = {
   id: string;
@@ -28,6 +30,20 @@ type ApiMessage = {
   role: Role;
   content: string;
   created_at: string;
+};
+
+type Bookmark = {
+  id: string;
+  name: string;
+  icon: string;
+  prompt_file: string | null;
+  created_at: string;
+};
+
+type BookmarksPayload = {
+  bookmarks: Bookmark[];
+  active: string;
+  thought?: string | null;
 };
 
 const starters = [
@@ -78,6 +94,15 @@ function Home() {
   const [error, setError] = useState('');
   const [lastFailedText, setLastFailedText] = useState('');
   const [reloadToken, setReloadToken] = useState(0);
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const [activeBookmark, setActiveBookmark] = useState('default');
+  const [dailyThought, setDailyThought] = useState('«Хороший разговор — это тоже прогулка»');
+  const [isLoadingBookmarks, setIsLoadingBookmarks] = useState(true);
+  const [isSwitchingBookmark, setIsSwitchingBookmark] = useState('');
+  const [isAddBookmarkOpen, setIsAddBookmarkOpen] = useState(false);
+  const [bookmarkDescription, setBookmarkDescription] = useState('');
+  const [bookmarkError, setBookmarkError] = useState('');
+  const [isCreatingBookmark, setIsCreatingBookmark] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -113,6 +138,44 @@ function Home() {
     };
 
     void loadDialog();
+    return () => {
+      cancelled = true;
+    };
+  }, [code, reloadToken]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadBookmarks = async () => {
+      setIsLoadingBookmarks(true);
+      setBookmarkError('');
+      try {
+        const response = await fetch(`/api/bookmarks/${encodeURIComponent(code)}`);
+        const payload = (await response.json()) as BookmarksPayload & { detail?: string };
+        if (!response.ok) {
+          throw new Error(payload.detail ?? 'Не удалось загрузить собеседников.');
+        }
+        if (!cancelled) {
+          setBookmarks(payload.bookmarks ?? []);
+          setActiveBookmark(payload.active ?? 'default');
+          setDailyThought(payload.thought ?? '«Хороший разговор — это тоже прогулка»');
+        }
+      } catch (loadError) {
+        if (!cancelled) {
+          setBookmarkError(
+            loadError instanceof Error
+              ? loadError.message
+              : 'Не удалось загрузить собеседников.',
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingBookmarks(false);
+        }
+      }
+    };
+
+    void loadBookmarks();
     return () => {
       cancelled = true;
     };
@@ -171,6 +234,73 @@ function Home() {
     submitMessage(draft);
   };
 
+  const handleCreateBookmark = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const description = bookmarkDescription.trim();
+    if (!description || isCreatingBookmark) return;
+
+    setBookmarkError('');
+    setIsCreatingBookmark(true);
+    try {
+      const response = await fetch(`/api/bookmarks/${encodeURIComponent(code)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description }),
+      });
+      const payload = (await response.json()) as BookmarksPayload & {
+        detail?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.detail ?? 'Не удалось создать собеседника.');
+      }
+      setBookmarks(payload.bookmarks ?? []);
+      setActiveBookmark(payload.active ?? 'default');
+      setDailyThought(payload.thought ?? '«Хороший разговор — это тоже прогулка»');
+      setBookmarkDescription('');
+      setIsAddBookmarkOpen(false);
+    } catch (createError) {
+      setBookmarkError(
+        createError instanceof Error
+          ? createError.message
+          : 'Не удалось создать собеседника.',
+      );
+    } finally {
+      setIsCreatingBookmark(false);
+    }
+  };
+
+  const handleActivateBookmark = async (bookmarkId: string) => {
+    if (bookmarkId === activeBookmark || isSwitchingBookmark) return;
+
+    setBookmarkError('');
+    setIsSwitchingBookmark(bookmarkId);
+    try {
+      const response = await fetch(
+        `/api/bookmarks/${encodeURIComponent(code)}/${encodeURIComponent(bookmarkId)}`,
+        { method: 'PUT' },
+      );
+      const payload = (await response.json()) as BookmarksPayload & {
+        messages?: ApiMessage[];
+        detail?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.detail ?? 'Не удалось сменить собеседника.');
+      }
+      setBookmarks(payload.bookmarks ?? []);
+      setActiveBookmark(payload.active ?? bookmarkId);
+      setDailyThought(payload.thought ?? '«Хороший разговор — это тоже прогулка»');
+      setMessages(fromApiMessages(payload.messages ?? []));
+    } catch (activateError) {
+      setBookmarkError(
+        activateError instanceof Error
+          ? activateError.message
+          : 'Не удалось сменить собеседника.',
+      );
+    } finally {
+      setIsSwitchingBookmark('');
+    }
+  };
+
   const handleDraftChange = (value: string) => {
     setDraft(value);
     const textarea = textareaRef.current;
@@ -223,6 +353,11 @@ function Home() {
                   {message.role === 'assistant' && (
                     <div className="avatar bot" aria-hidden="true">
                       П
+                    </div>
+                  )}
+                  {message.role === 'system' && (
+                    <div className="system-mark" aria-hidden="true">
+                      <Sparkles size={14} strokeWidth={1.8} />
                     </div>
                   )}
                   <div className="message-bubble">
@@ -338,11 +473,103 @@ function Home() {
             </section>
             <div className="small-ritual" data-testid="text-daily-thought">
               <Sparkles size={15} color="#b46e55" strokeWidth={1.8} aria-hidden="true" />
-              <p>«Хороший разговор — это тоже прогулка»</p>
-              <span>маленькая мысль на сегодня</span>
+              <p>{dailyThought}</p>
+              <span>мысль от выбранного собеседника</span>
             </div>
+            <section className="bookmarks-card" aria-labelledby="bookmarks-heading">
+              <div className="bookmarks-heading">
+                <div>
+                  <p className="side-label" id="bookmarks-heading">Собеседники</p>
+                  <span className="bookmarks-count">{bookmarks.length}/10</span>
+                </div>
+                <Sparkles size={16} strokeWidth={1.7} aria-hidden="true" />
+              </div>
+              <div className="bookmarks-list">
+                {isLoadingBookmarks && (
+                  <div className="bookmarks-loading">Загружаю список...</div>
+                )}
+                {!isLoadingBookmarks && bookmarks.map((bookmark) => (
+                  <button
+                    className={`bookmark-item ${bookmark.id === activeBookmark ? 'active' : ''}`}
+                    type="button"
+                    key={bookmark.id}
+                    onClick={() => void handleActivateBookmark(bookmark.id)}
+                    disabled={Boolean(isSwitchingBookmark)}
+                    aria-pressed={bookmark.id === activeBookmark}
+                  >
+                    <span className="bookmark-icon" aria-hidden="true">{bookmark.icon}</span>
+                    <span className="bookmark-name">{bookmark.name}</span>
+                    {isSwitchingBookmark === bookmark.id && <span className="bookmark-spinner" aria-hidden="true" />}
+                  </button>
+                ))}
+              </div>
+              {bookmarkError && <p className="bookmark-error" role="alert">{bookmarkError}</p>}
+              <button
+                className="add-bookmark-button"
+                type="button"
+                onClick={() => {
+                  setBookmarkError('');
+                  setIsAddBookmarkOpen(true);
+                }}
+                disabled={bookmarks.length >= 10 || isLoadingBookmarks}
+              >
+                <Plus size={16} strokeWidth={2} aria-hidden="true" />
+                Добавить нового
+              </button>
+            </section>
           </aside>
         </div>
+        {isAddBookmarkOpen && (
+          <div
+            className="bookmark-modal-backdrop"
+            role="presentation"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget && !isCreatingBookmark) {
+                setIsAddBookmarkOpen(false);
+              }
+            }}
+          >
+            <section className="bookmark-modal" role="dialog" aria-modal="true" aria-labelledby="bookmark-modal-title">
+              <button
+                className="bookmark-modal-close"
+                type="button"
+                aria-label="Закрыть"
+                onClick={() => {
+                  if (!isCreatingBookmark) setIsAddBookmarkOpen(false);
+                }}
+              >
+                <X size={19} aria-hidden="true" />
+              </button>
+              <p className="welcome-kicker">новый собеседник</p>
+              <h2 id="bookmark-modal-title">Опишите, с кем поговорим</h2>
+              <p className="bookmark-modal-copy">
+                Например: «Сергей Есенин, поэт, говори поэтично про природу».
+              </p>
+              <form onSubmit={handleCreateBookmark}>
+                <textarea
+                  className="bookmark-description"
+                  value={bookmarkDescription}
+                  onChange={(event) => setBookmarkDescription(event.target.value)}
+                  placeholder="Кто это и как он должен разговаривать?"
+                  maxLength={1200}
+                  rows={5}
+                  autoFocus
+                  disabled={isCreatingBookmark}
+                />
+                <div className="bookmark-modal-footer">
+                  <span>{bookmarkDescription.length}/1200</span>
+                  <button
+                    className="bookmark-create-button"
+                    type="submit"
+                    disabled={!bookmarkDescription.trim() || isCreatingBookmark}
+                  >
+                    {isCreatingBookmark ? 'Создаю...' : 'Создать'}
+                  </button>
+                </div>
+              </form>
+            </section>
+          </div>
+        )}
       </div>
     </main>
   );

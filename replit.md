@@ -23,7 +23,7 @@
 - `artifacts/papa-bot/` — user-facing chat at `/dialog/<code>`
 - `artifacts/api-server/main.py` — FastAPI routes, session storage, and OpenAI client
 - `artifacts/api-server/.env.example` — non-secret configuration reference
-- `data/sessions/` — local JSON histories, one file per dialog code
+- `data/sessions/<code>/` — local history, bookmarks, and generated prompt files for one dialog code
 
 ## Architecture decisions
 
@@ -31,12 +31,14 @@
 - The frontend route is `/dialog/<code>` and the API is `/api/dialog/<code>`.
 - The OpenAI client uses configurable `OPENAI_BASE_URL`, so an OpenAI-compatible provider can be substituted without code changes.
 - Conversation histories are saved atomically as JSON files instead of using the unused database scaffold.
+- Character bookmarks use Yandex Search API context plus the configured LLM; both integrations remain empty until deployment configuration is provided.
 
 ## Product
 
 - A visitor opens a personal `/dialog/<code>` link.
 - The chat loads only that code's history and sends new messages to FastAPI.
 - The backend forwards the conversation to the configured OpenAI-compatible API and persists successful exchanges.
+- Character bookmarks can be created, moderated, switched, and stored inside the same dialog code without clearing its history.
 
 ## User preferences
 
@@ -45,6 +47,7 @@
 ## Gotchas
 
 - `OPENAI_API_KEY` is required for sending messages; without it, the API intentionally returns a clear 503 instead of silently using mock replies.
+- Creating a character requires both OpenAI-compatible LLM settings and `YANDEX_SEARCH_API_KEY` plus `YANDEX_SEARCH_FOLDER_ID`.
 - Codes must be exactly six ASCII letters or digits. Uppercase links are treated as the same lowercase session.
 
 ## Pointers

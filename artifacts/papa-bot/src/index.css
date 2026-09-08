@@ -307,6 +307,40 @@
   background: rgba(237, 211, 188, .6);
 }
 
+.message-row.system {
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #8d786a;
+  font-size: 12px;
+}
+
+.message-row.system .message-bubble {
+  max-width: min(520px, 100%);
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 999px;
+  color: inherit;
+  background: rgba(239, 226, 207, .58);
+  box-shadow: none;
+  font-size: 12px;
+  text-align: center;
+}
+
+.message-row.system .message-meta {
+  display: none;
+}
+
+.system-mark {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  border-radius: 50%;
+  color: #a66b55;
+  background: rgba(239, 222, 203, .8);
+}
+
 .message-meta {
   margin-top: 8px;
   color: hsl(var(--muted-foreground));
@@ -538,6 +572,257 @@
   font-size: 11px;
 }
 
+.bookmarks-card {
+  margin-top: 24px;
+  padding: 19px 17px 15px;
+  border: 1px solid rgba(104, 140, 121, .16);
+  border-radius: 20px 20px 20px 6px;
+  background: rgba(242, 246, 237, .68);
+  box-shadow: 0 13px 28px rgba(57, 76, 65, .055);
+}
+
+.bookmarks-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  color: #6b8b78;
+}
+
+.bookmarks-heading > svg {
+  color: #b46e55;
+}
+
+.side-label {
+  margin: 0;
+  color: #839188;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.bookmarks-count {
+  display: block;
+  margin-top: 4px;
+  color: #a09688;
+  font-size: 10px;
+}
+
+.bookmarks-list {
+  display: grid;
+  gap: 5px;
+  margin-top: 14px;
+}
+
+.bookmark-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 42px;
+  padding: 7px 9px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  color: #536b5e;
+  background: transparent;
+  text-align: left;
+  transition: border-color .2s ease, background-color .2s ease, transform .2s ease;
+}
+
+.bookmark-item:hover:not(:disabled) {
+  border-color: rgba(104, 140, 121, .23);
+  background: rgba(224, 237, 220, .72);
+  transform: translateX(2px);
+}
+
+.bookmark-item.active {
+  border-color: rgba(104, 140, 121, .3);
+  color: #345c4d;
+  background: rgba(218, 233, 215, .84);
+  font-weight: 700;
+}
+
+.bookmark-item:disabled {
+  cursor: wait;
+  opacity: .7;
+}
+
+.bookmark-icon {
+  display: grid;
+  flex: 0 0 auto;
+  width: 27px;
+  height: 27px;
+  place-items: center;
+  border-radius: 9px;
+  background: rgba(255, 250, 235, .82);
+  font-size: 17px;
+}
+
+.bookmark-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.bookmark-spinner {
+  width: 12px;
+  height: 12px;
+  margin-left: auto;
+  border: 2px solid rgba(104, 140, 121, .22);
+  border-top-color: #688c79;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+
+.bookmarks-loading {
+  padding: 9px;
+  color: #8a988e;
+  font-size: 12px;
+}
+
+.bookmark-error {
+  margin: 10px 2px 0;
+  color: #955e4c;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.add-bookmark-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 8px 10px;
+  border: 1px dashed #afc4ae;
+  border-radius: 999px;
+  color: #5b806d;
+  background: rgba(255, 252, 241, .55);
+  font-size: 12px;
+  transition: border-color .2s ease, background-color .2s ease, transform .2s ease;
+}
+
+.add-bookmark-button:hover:not(:disabled) {
+  border-color: #779c84;
+  background: #eef5e9;
+  transform: translateY(-1px);
+}
+
+.add-bookmark-button:disabled {
+  cursor: default;
+  opacity: .45;
+}
+
+.bookmark-modal-backdrop {
+  position: fixed;
+  z-index: 10;
+  inset: 0;
+  display: grid;
+  padding: 20px;
+  place-items: center;
+  background: rgba(39, 56, 48, .22);
+  backdrop-filter: blur(5px);
+  animation: fade-in .2s ease both;
+}
+
+.bookmark-modal {
+  position: relative;
+  width: min(100%, 520px);
+  padding: 30px;
+  border: 1px solid rgba(104, 140, 121, .22);
+  border-radius: 24px 24px 24px 8px;
+  background: #f8f4e9;
+  box-shadow: 0 24px 70px rgba(39, 56, 48, .22);
+  animation: modal-in .3s cubic-bezier(.22, .7, .3, 1) both;
+}
+
+.bookmark-modal h2 {
+  max-width: 360px;
+  margin: 0;
+  color: hsl(var(--foreground));
+  font-family: var(--app-font-serif);
+  font-size: 37px;
+  font-weight: 500;
+  letter-spacing: -.04em;
+  line-height: .98;
+}
+
+.bookmark-modal-close {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  display: grid;
+  width: 35px;
+  height: 35px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  color: #6c8475;
+  background: rgba(224, 235, 219, .72);
+}
+
+.bookmark-modal-copy {
+  max-width: 405px;
+  margin: 16px 0 20px;
+  color: #718277;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.bookmark-description {
+  display: block;
+  width: 100%;
+  min-height: 118px;
+  padding: 14px 15px;
+  resize: vertical;
+  border: 1px solid #c7d5c3;
+  border-radius: 15px;
+  outline: 0;
+  color: hsl(var(--foreground));
+  background: rgba(255, 253, 245, .72);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.bookmark-description:focus {
+  border-color: #719782;
+  box-shadow: 0 0 0 4px rgba(104, 140, 121, .12);
+}
+
+.bookmark-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.bookmark-modal-footer > span {
+  color: #9a9e91;
+  font-size: 11px;
+}
+
+.bookmark-create-button {
+  padding: 11px 18px;
+  border: 0;
+  border-radius: 13px;
+  color: hsl(var(--primary-foreground));
+  background: hsl(var(--primary));
+  font-size: 13px;
+  font-weight: 800;
+  transition: transform .2s ease, opacity .2s ease, background-color .2s ease;
+}
+
+.bookmark-create-button:hover:not(:disabled) {
+  background: #3e6558;
+  transform: translateY(-1px);
+}
+
+.bookmark-create-button:disabled {
+  cursor: default;
+  opacity: .45;
+}
+
 .error-card {
   display: flex;
   align-items: flex-start;
@@ -603,6 +888,20 @@
 @keyframes typing {
   0%, 60%, 100% { opacity: .35; transform: translateY(0); }
   30% { opacity: 1; transform: translateY(-3px); }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes modal-in {
+  from { opacity: 0; transform: translateY(12px) scale(.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 @media (max-width: 760px) {
