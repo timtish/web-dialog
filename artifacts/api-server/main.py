@@ -22,7 +22,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-logger = logging.getLogger("papa-bot")
+logger = logging.getLogger("dialog")
 
 CODE_RE = re.compile(r"^[A-Za-z0-9]{6}$")
 MAX_BOOKMARKS = 10
@@ -35,6 +35,9 @@ DEFAULT_SYSTEM_PROMPT = """Ты — доброжелательный собес�
 абстиненции, суицидальных мыслях или резком ухудшении здоровья, спокойно посоветуй
 обратиться к близкому человеку или вызвать скорую помощь. Не изображай врача."""
 DEFAULT_DAILY_THOUGHT = "«Хороший разговор — это тоже прогулка»"
+DEFAULT_BOOKMARK_ID = "default"
+DEFAULT_BOOKMARK_NAME = "Просто поговорить"
+DEFAULT_BOOKMARK_ICON = "🌿"
 UNIVERSAL_CHARACTER_SAFETY = """## Общая безопасность
 - Не поощряй алкоголь, наркотики, насилие или самоповреждение.
 - Если разговор касается алкоголя или наркотиков, мягко отговаривай и предлагай безопасную альтернативу.
@@ -201,12 +204,7 @@ class SessionStore:
         if not path.exists():
             return BookmarksState(
                 bookmarks=[
-                    Bookmark(
-                        id="default",
-                        name="По умолчанию",
-                        icon="🎭",
-                        created_at=datetime.now(UTC),
-                    )
+                    self._default_bookmark()
                 ]
             )
 
@@ -214,16 +212,8 @@ class SessionStore:
             state = BookmarksState.model_validate(
                 json.loads(path.read_text(encoding="utf-8"))
             )
-            if not any(bookmark.id == "default" for bookmark in state.bookmarks):
-                state.bookmarks.insert(
-                    0,
-                    Bookmark(
-                        id="default",
-                        name="По умолчанию",
-                        icon="🎭",
-                        created_at=datetime.now(UTC),
-                    ),
-                )
+            if not any(bookmark.id == DEFAULT_BOOKMARK_ID for bookmark in state.bookmarks):
+                state.bookmarks.insert(0, self._default_bookmark())
             return state
         except (OSError, TypeError, ValueError) as error:
             logger.exception("Could not read bookmarks for %s: %s", code, error)
@@ -231,6 +221,15 @@ class SessionStore:
                 status_code=500,
                 detail="Не удалось прочитать список собеседников.",
             ) from error
+
+    @staticmethod
+    def _default_bookmark() -> Bookmark:
+        return Bookmark(
+            id=DEFAULT_BOOKMARK_ID,
+            name=DEFAULT_BOOKMARK_NAME,
+            icon=DEFAULT_BOOKMARK_ICON,
+            created_at=datetime.now(UTC),
+        )
 
     def save_bookmarks(self, code: str, state: BookmarksState) -> None:
         path = self._bookmarks_path_for(code)
@@ -538,7 +537,7 @@ async def moderate_description(description: str) -> None:
     except MissingOpenAIKeyError as error:
         raise HTTPException(
             status_code=503,
-            detail="Для создания собеседника нужно настроить OpenAI API.",
+            detail="Новые собеседники пока недоступны.",
         ) from error
 
     if result.strip().upper().startswith("REJECT"):
@@ -584,7 +583,7 @@ System prompt должен быть 200–300 слов: опиши роль, т�
     except MissingOpenAIKeyError as error:
         raise HTTPException(
             status_code=503,
-            detail="Для создания собеседника нужно настроить OpenAI API.",
+            detail="Новые собеседники пока недоступны.",
         ) from error
 
     payload = parse_json_object(raw_result)
@@ -629,7 +628,7 @@ def response_for(code: str, messages: list[DialogMessage]) -> DialogResponse:
 async def lifespan(_: FastAPI):
     settings.sessions_dir.mkdir(parents=True, exist_ok=True)
     logger.info(
-        "Papa-bot API started with sessions=%s model=%s openai_configured=%s",
+        "Dialog API started with sessions=%s model=%s openai_configured=%s",
         settings.sessions_dir,
         settings.openai_model,
         bool(settings.openai_api_key),
@@ -637,7 +636,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Папа-бот API", lifespan=lifespan)
+app = FastAPI(title="Dialog API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -827,10 +826,10 @@ async def delete_bookmark(
                 status_code=404,
                 detail="Такого собеседника нет в этом разговоре.",
             )
-        if target.id == "default":
+        if target.id == DEFAULT_BOOKMARK_ID:
             raise HTTPException(
                 status_code=400,
-                detail="Собеседника «По умолчанию» удалить нельзя.",
+                detail="Собеседника «Просто поговорить» удалить нельзя.",
             )
         if state.active_bookmark == target.id:
             raise HTTPException(
@@ -885,7 +884,7 @@ async def send_message(
         except MissingOpenAIKeyError as error:
             raise HTTPException(
                 status_code=503,
-                detail="OpenAI API пока не настроен на сервере.",
+                detail="Ответить пока не получится. Попробуйте ещё раз позже.",
             ) from error
 
         assistant_message = DialogMessage(

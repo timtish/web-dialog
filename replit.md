@@ -5,7 +5,7 @@
 ## Run & Operate
 
 - `python artifacts/api-server/main.py` — run the FastAPI API server (port 8080)
-- `pnpm --filter @workspace/papa-bot run dev` — run the frontend
+- `pnpm --filter @workspace/dialog run dev` — run the frontend
 - `pnpm run typecheck` — full typecheck across all packages
 - `python -m py_compile artifacts/api-server/main.py` — check the FastAPI syntax
 - Configuration template: `artifacts/api-server/.env.example`
@@ -20,7 +20,7 @@
 
 ## Where things live
 
-- `artifacts/papa-bot/` — user-facing chat at `/dialog/<code>`
+- `artifacts/dialog/` — user-facing chat at `/dialog/<code>`
 - `artifacts/api-server/main.py` — FastAPI routes, session storage, and OpenAI client
 - `artifacts/api-server/.env.example` — non-secret configuration reference
 - `data/sessions/<code>/` — local history, bookmarks, and generated prompt files for one dialog code
