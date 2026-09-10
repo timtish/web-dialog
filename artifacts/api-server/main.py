@@ -36,7 +36,7 @@ DEFAULT_SYSTEM_PROMPT = """Ты — доброжелательный собес�
 обратиться к близкому человеку или вызвать скорую помощь. Не изображай врача."""
 DEFAULT_DAILY_THOUGHT = "«Хороший разговор — это тоже прогулка»"
 DEFAULT_BOOKMARK_ID = "default"
-DEFAULT_BOOKMARK_NAME = "Просто поговорить"
+DEFAULT_BOOKMARK_NAME = "Просто спросить"
 DEFAULT_BOOKMARK_ICON = "🌿"
 UNIVERSAL_CHARACTER_SAFETY = """## Общая безопасность
 - Не поощряй алкоголь, наркотики, насилие или самоповреждение.
@@ -829,7 +829,7 @@ async def delete_bookmark(
         if target.id == DEFAULT_BOOKMARK_ID:
             raise HTTPException(
                 status_code=400,
-                detail="Собеседника «Просто поговорить» удалить нельзя.",
+                detail="Собеседника «Просто спросить» удалить нельзя.",
             )
         if state.active_bookmark == target.id:
             raise HTTPException(

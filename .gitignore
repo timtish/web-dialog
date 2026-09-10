@@ -50,3 +50,5 @@ Thumbs.db
 
 # Dialogs conversation sessions
 /data/sessions/
+
+__pycache__
