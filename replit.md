@@ -1,11 +1,11 @@
-# Папа-бот
+# Dialog (бывш. Папа-бот)
 
 Одностраничный тёплый чат для разговоров по персональной ссылке, где шестизначный код определяет отдельную историю.
 
 ## Run & Operate
 
 - `python artifacts/api-server/main.py` — run the FastAPI API server (port 8080)
-- `pnpm --filter @workspace/dialog run dev` — run the frontend
+- `PORT=5173 BASE_PATH=/ pnpm --filter @workspace/dialog run dev` — run the frontend (PORT and BASE_PATH are required, Vite fails without them)
 - `pnpm run typecheck` — full typecheck across all packages
 - `python -m py_compile artifacts/api-server/main.py` — check the FastAPI syntax
 - Configuration template: `artifacts/api-server/.env.example`
@@ -24,6 +24,7 @@
 - `artifacts/api-server/main.py` — FastAPI routes, session storage, and OpenAI client
 - `artifacts/api-server/.env.example` — non-secret configuration reference
 - `data/sessions/<code>/` — local history, bookmarks, and generated prompt files for one dialog code
+- `lib/` — generated OpenAPI artifacts: api-spec, api-zod, api-client-react, db (frontend calls `/api/*` through the Vite proxy in dev)
 
 ## Architecture decisions
 
@@ -49,6 +50,9 @@
 - `OPENAI_API_KEY` is required for sending messages; without it, the API intentionally returns a clear 503 instead of silently using mock replies.
 - Creating a character requires both OpenAI-compatible LLM settings and `YANDEX_SEARCH_API_KEY` plus `YANDEX_SEARCH_FOLDER_ID`.
 - Codes must be exactly six ASCII letters or digits. Uppercase links are treated as the same lowercase session.
+- `pnpm install` is required once after cloning/renaming the workspace package; otherwise `vite: command not found` in `artifacts/dialog`.
+- Vite dev server proxies `/api` to `localhost:8080`; the API server must be running for the chat to work in dev.
+- The default persona is "Просто спросить" (🌿); messages array starts with one system message, and character switching is noted via a system message inside history (watch for strict providers rejecting mid-history system roles).
 
 ## Pointers
 

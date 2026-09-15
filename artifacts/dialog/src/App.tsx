@@ -6,7 +6,6 @@ import {
   Plus,
   Send,
   Sparkles,
-  X,
 } from 'lucide-react';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
@@ -40,6 +39,22 @@ type Bookmark = {
   created_at: string;
 };
 
+type Weather = {
+  temperature: number;
+  summary: string;
+  place: string;
+  updated_at: string;
+};
+
+type GreetingPayload = {
+  text: string;
+  time_of_day: 'утро' | 'день' | 'вечер' | 'ночь';
+};
+
+type HoroscopePayload = {
+  horoscope: string;
+};
+
 function isDefaultBookmarkId(bookmarkId: string | undefined) {
   return !bookmarkId || bookmarkId === DEFAULT_BOOKMARK_ID;
 }
@@ -52,6 +67,13 @@ function activeSpeakerName(bookmarks: Bookmark[], activeBookmark: string) {
   return active.name;
 }
 
+type SendMessagePayload = {
+  messages?: ApiMessage[];
+  reply?: string;
+  created_bookmark?: Bookmark | null;
+  detail?: string;
+};
+
 type BookmarksPayload = {
   bookmarks: Bookmark[];
   active: string;
@@ -61,12 +83,12 @@ type BookmarksPayload = {
 const starters = [
   'Расскажи что-нибудь интересное',
   'Хочу просто поговорить',
-  'Помоги вспомнить название фильма',
+  'Хочу поговорить с поэтом Есениным',
   'Что сегодня нового?',
 ];
 
 const DEFAULT_BOOKMARK_ID = 'default';
-const DEFAULT_BOOKMARK_NAME = 'Просто поговорить';
+const DEFAULT_BOOKMARK_NAME = 'Просто спросить';
 const DEFAULT_BOOKMARK_DESCRIPTION = 'Начать обычный разговор';
 const COMPOSER_PLACEHOLDER = 'Напишите, что на душе...';
 
@@ -115,12 +137,13 @@ function Home() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [activeBookmark, setActiveBookmark] = useState('default');
   const [dailyThought, setDailyThought] = useState('«Хороший разговор — это тоже прогулка»');
+  const [horoscope, setHoroscope] = useState('');
+  const [weather, setWeather] = useState<Weather | null>(null);
+  const [greeting, setGreeting] = useState('');
   const [isLoadingBookmarks, setIsLoadingBookmarks] = useState(true);
   const [isSwitchingBookmark, setIsSwitchingBookmark] = useState('');
-  const [isAddBookmarkOpen, setIsAddBookmarkOpen] = useState(false);
-  const [bookmarkDescription, setBookmarkDescription] = useState('');
   const [bookmarkError, setBookmarkError] = useState('');
-  const [isCreatingBookmark, setIsCreatingBookmark] = useState(false);
+  const [isRefreshingBookmarks, setIsRefreshingBookmarks] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -199,6 +222,83 @@ function Home() {
     };
   }, [code, reloadToken]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadWeather = async () => {
+      try {
+        const response = await fetch('/api/weather');
+        const payload = (await response.json()) as Weather & { detail?: string };
+        if (!response.ok) {
+          return;
+        }
+        if (!cancelled) {
+          setWeather({
+            temperature: payload.temperature,
+            summary: payload.summary,
+            place: payload.place,
+            updated_at: payload.updated_at,
+          });
+        }
+      } catch {
+        // Погода — второстепенная карточка: тихо остаёмся без данных.
+      }
+    };
+
+    void loadWeather();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadGreeting = async () => {
+      try {
+        const response = await fetch('/api/greeting');
+        const payload = (await response.json()) as GreetingPayload;
+        if (!response.ok) {
+          return;
+        }
+        if (!cancelled) {
+          setGreeting(payload.text);
+        }
+      } catch {
+        // Без приветствия показываем нейтральный fallback ниже.
+      }
+    };
+
+    void loadGreeting();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadHoroscope = async () => {
+      try {
+        const response = await fetch('/api/horoscope');
+        const payload = (await response.json()) as HoroscopePayload & { detail?: string };
+        if (!response.ok) {
+          return;
+        }
+        if (!cancelled) {
+          setHoroscope(payload.horoscope);
+        }
+      } catch {
+        // Гороскоп — второстепенная карточка: тихо остаёмся на фолбэке.
+      }
+    };
+
+    void loadHoroscope();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const submitMessage = async (rawText: string, isRetry = false) => {
     const text = rawText.trim();
     if (!text || isSending) return;
@@ -228,13 +328,16 @@ function Home() {
           body: JSON.stringify({ message: text }),
         },
       );
-      const payload = (await response.json()) as
-        | { messages?: ApiMessage[]; detail?: string }
-        | undefined;
+      const payload = (await response.json()) as SendMessagePayload;
       if (!response.ok) {
         throw new Error(payload?.detail ?? 'Собеседник пока не отвечает.');
       }
       setMessages(fromApiMessages(payload?.messages ?? []));
+      if (payload?.created_bookmark) {
+        // Агент-создатель добавил собеседника прямо в общем диалоге —
+        // подтягиваем обновлённый список справа.
+        void refreshBookmarks();
+      }
     } catch (sendError) {
       setLastFailedText(text);
       setError(
@@ -252,43 +355,36 @@ function Home() {
     submitMessage(draft);
   };
 
-  const handleCreateBookmark = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const description = bookmarkDescription.trim();
-    if (!description || isCreatingBookmark) return;
-
+  const refreshBookmarks = async () => {
+    if (isRefreshingBookmarks) return;
+    setIsRefreshingBookmarks(true);
     setBookmarkError('');
-    setIsCreatingBookmark(true);
     try {
-      const response = await fetch(`/api/bookmarks/${encodeURIComponent(code)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ description }),
-      });
-      const payload = (await response.json()) as BookmarksPayload & {
-        detail?: string;
-      };
+      const response = await fetch(`/api/bookmarks/${encodeURIComponent(code)}`);
+      const payload = (await response.json()) as BookmarksPayload & { detail?: string };
       if (!response.ok) {
-        throw new Error(payload.detail ?? 'Не удалось создать собеседника.');
+        throw new Error(payload.detail ?? 'Не удалось загрузить собеседников.');
       }
       setBookmarks(payload.bookmarks ?? []);
       setActiveBookmark(payload.active ?? 'default');
       setDailyThought(payload.thought ?? '«Хороший разговор — это тоже прогулка»');
-      setBookmarkDescription('');
-      setIsAddBookmarkOpen(false);
-    } catch (createError) {
+    } catch (refreshError) {
       setBookmarkError(
-        createError instanceof Error
-          ? createError.message
-          : 'Не удалось создать собеседника.',
+        refreshError instanceof Error
+          ? refreshError.message
+          : 'Не удалось загрузить собеседников.',
       );
     } finally {
-      setIsCreatingBookmark(false);
+      setIsRefreshingBookmarks(false);
     }
   };
 
-  const handleActivateBookmark = async (bookmarkId: string) => {
-    if (bookmarkId === activeBookmark || isSwitchingBookmark) return;
+  const handleActivateBookmark = async (
+    bookmarkId: string,
+    options: { allowSame?: boolean } = {},
+  ) => {
+    if (isSwitchingBookmark) return;
+    if (bookmarkId === activeBookmark && !options.allowSame) return;
 
     setBookmarkError('');
     setIsSwitchingBookmark(bookmarkId);
@@ -319,6 +415,14 @@ function Home() {
     }
   };
 
+  const handleOpenCreatorMode = () => {
+    setBookmarkError('');
+    // Создание собеседника теперь живёт в общем диалоге: переключаемся на
+    // встроенного собеседника «Просто спросить» — история при этом сохраняется.
+    void handleActivateBookmark(DEFAULT_BOOKMARK_ID, { allowSame: true });
+    textareaRef.current?.focus();
+  };
+
   const handleDraftChange = (value: string) => {
     setDraft(value);
     const textarea = textareaRef.current;
@@ -329,34 +433,36 @@ function Home() {
   };
 
   const speakerName = activeSpeakerName(bookmarks, activeBookmark);
-  const avatarLetter = speakerName.trim().charAt(0).toUpperCase() || 'П';
+  const avatarLetter = speakerName.trim().charAt(0).toUpperCase() || 'ИИ';
   const composerPlaceholder = isDefaultBookmarkId(activeBookmark)
     ? COMPOSER_PLACEHOLDER
     : `Напишите ${speakerName}...`;
+  const emptyGreeting = greeting || 'Добрый день.';
+  const emptyHint = isDefaultBookmarkId(activeBookmark)
+    ? 'Можно спросить что угодно или попросить создать нового собеседника'
+    : `Я — ${speakerName}. Рад встрече. О чём поговорим?`;
+
+  const formatWeatherTemperature = (value: number) => {
+    const rounded = Math.round(value);
+    return `${rounded > 0 ? '+' : ''}${rounded}°`;
+  };
+
+  const formatWeatherPlace = (value: Weather) => {
+    const weekday = new Intl.DateTimeFormat('ru-RU', { weekday: 'long' }).format(
+      new Date(value.updated_at),
+    );
+    return `${value.place} · ${weekday}`;
+  };
 
   return (
     <main className="papa-page">
       <div className="papa-shell">
-        <header className="papa-topbar" data-testid="header-main">
-          <a className="papa-brand" href="/" data-testid="link-home">
-            <span className="brand-mark" aria-hidden="true">
-              <span />
-            </span>
-            <span className="brand-wordmark"></span>
-          </a>
-          <div className="topbar-note" data-testid="status-companion"></div>
-        </header>
 
         <div className="papa-layout">
           <section className="conversation-column" aria-labelledby="welcome-heading">
-            <p className="welcome-kicker">тихий вечер, без спешки</p>
             <h1 className="welcome-title" id="welcome-heading">
               Ну что, <em>поговорим?</em>
             </h1>
-            <p className="welcome-subtitle">
-              Можно спросить что угодно, вспомнить хорошее или просто оставить
-              пару слов. Я здесь и никуда не тороплюсь.
-            </p>
 
             <div className="conversation-log" aria-live="polite" data-testid="conversation-log">
               {isLoadingHistory && (
@@ -366,19 +472,18 @@ function Home() {
               )}
               {!isLoadingHistory && messages.length === 0 && (
                 <div className="empty-note" data-testid="empty-conversation">
-                  <strong>Добрый вечер.</strong>
-                  <span>
-                    {isDefaultBookmarkId(activeBookmark)
-                      ? 'Рад тебя видеть. Как прошёл день?'
-                      : `Я — ${speakerName}. Рад встрече. О чём поговорим?`}
-                  </span>
+                  <strong>{emptyGreeting}</strong>
+                  <span>{emptyHint}</span>
                 </div>
               )}
               {messages.map((message) => (
                 <article className={`message-row ${message.role}`} key={message.id} data-testid={`message-${message.id}`}>
                   {message.role === 'assistant' && (
-                    <div className="avatar bot" aria-hidden="true">
-                      {avatarLetter}
+                    <div className="message-side">
+                      <div className="avatar bot" aria-hidden="true">
+                        {avatarLetter}
+                      </div>
+                      <div className="message-meta">{message.time}</div>
                     </div>
                   )}
                   {message.role === 'system' && (
@@ -388,19 +493,23 @@ function Home() {
                   )}
                   <div className="message-bubble">
                     <div data-testid={`message-text-${message.id}`}>{message.text}</div>
-                    <div className="message-meta">{message.time}</div>
                   </div>
                   {message.role === 'user' && (
-                    <div className="avatar user" aria-hidden="true">
-                      В
+                    <div className="message-side">
+                      <div className="avatar user" aria-hidden="true">
+                        В
+                      </div>
+                      <div className="message-meta">{message.time}</div>
                     </div>
                   )}
                 </article>
               ))}
               {isSending && (
                 <div className="message-row" data-testid="status-sending">
-                  <div className="avatar bot" aria-hidden="true">
-                    {avatarLetter}
+                  <div className="message-side">
+                    <div className="avatar bot" aria-hidden="true">
+                      {avatarLetter}
+                    </div>
                   </div>
                   <div className="message-bubble typing-bubble" aria-label="бот печатает">
                     <i />
@@ -493,13 +602,24 @@ function Home() {
                 <span>Сегодня</span>
                 <CloudSun className="weather-icon" size={24} strokeWidth={1.7} aria-hidden="true" />
               </div>
-              <div className="weather-temp" data-testid="text-temperature">+8°</div>
-              <div className="weather-summary">пасмурно, но тепло</div>
-              <div className="weather-place">Тула · вторник</div>
+              {weather ? (
+                <>
+                  <div className="weather-temp" data-testid="text-temperature">
+                    {formatWeatherTemperature(weather.temperature)}
+                  </div>
+                  <div className="weather-summary">{weather.summary}</div>
+                  <div className="weather-place">{formatWeatherPlace(weather)}</div>
+                </>
+              ) : (
+                <>
+                  <div className="weather-temp" data-testid="text-temperature">—°</div>
+                  <div className="weather-summary">Погода пока не загрузилась</div>
+                </>
+              )}
             </section>
             <div className="small-ritual" data-testid="text-daily-thought">
               <Sparkles size={15} color="#b46e55" strokeWidth={1.8} aria-hidden="true" />
-              <p>{dailyThought}</p>
+              <p>{horoscope && isDefaultBookmarkId(activeBookmark) ? horoscope : dailyThought}</p>
               <span>{DEFAULT_BOOKMARK_DESCRIPTION}</span>
             </div>
             <section className="bookmarks-card" aria-labelledby="bookmarks-heading">
@@ -533,10 +653,7 @@ function Home() {
               <button
                 className="add-bookmark-button"
                 type="button"
-                onClick={() => {
-                  setBookmarkError('');
-                  setIsAddBookmarkOpen(true);
-                }}
+                onClick={handleOpenCreatorMode}
                 disabled={bookmarks.length >= 10 || isLoadingBookmarks}
               >
                 <Plus size={16} strokeWidth={2} aria-hidden="true" />
@@ -545,57 +662,6 @@ function Home() {
             </section>
           </aside>
         </div>
-        {isAddBookmarkOpen && (
-          <div
-            className="bookmark-modal-backdrop"
-            role="presentation"
-            onMouseDown={(event) => {
-              if (event.target === event.currentTarget && !isCreatingBookmark) {
-                setIsAddBookmarkOpen(false);
-              }
-            }}
-          >
-            <section className="bookmark-modal" role="dialog" aria-modal="true" aria-labelledby="bookmark-modal-title">
-              <button
-                className="bookmark-modal-close"
-                type="button"
-                aria-label="Закрыть"
-                onClick={() => {
-                  if (!isCreatingBookmark) setIsAddBookmarkOpen(false);
-                }}
-              >
-                <X size={19} aria-hidden="true" />
-              </button>
-              <p className="welcome-kicker">новый собеседник</p>
-              <h2 id="bookmark-modal-title">Опишите, с кем поговорим</h2>
-              <p className="bookmark-modal-copy">
-                Например: «Сергей Есенин, поэт, говори поэтично про природу».
-              </p>
-              <form onSubmit={handleCreateBookmark}>
-                <textarea
-                  className="bookmark-description"
-                  value={bookmarkDescription}
-                  onChange={(event) => setBookmarkDescription(event.target.value)}
-                  placeholder="Кто это и как он должен разговаривать?"
-                  maxLength={1200}
-                  rows={5}
-                  autoFocus
-                  disabled={isCreatingBookmark}
-                />
-                <div className="bookmark-modal-footer">
-                  <span>{bookmarkDescription.length}/1200</span>
-                  <button
-                    className="bookmark-create-button"
-                    type="submit"
-                    disabled={!bookmarkDescription.trim() || isCreatingBookmark}
-                  >
-                    {isCreatingBookmark ? 'Создаю...' : 'Создать'}
-                  </button>
-                </div>
-              </form>
-            </section>
-          </div>
-        )}
       </div>
     </main>
   );

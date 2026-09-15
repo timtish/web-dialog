@@ -1,0 +1,35 @@
+# /etc/systemd/system/dialog.service
+# Один процесс FastAPI раздаёт и API (/api/*), и собранный фронтенд (SPA).
+[Unit]
+Description=Dialog (FastAPI: API + static UI) on port 8011
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dialog
+Group=dialog
+
+WorkingDirectory=/opt/dialog
+
+# Порт API и раздаваемого UI: main.py читает переменную PORT (по умолчанию 8080).
+Environment=PORT=8011
+
+# Каталог собранного фронтенда (по умолчанию artifacts/dialog/dist/public).
+# Собрать его перед запуском: PORT=8011 BASE_PATH=/ pnpm --filter @workspace/dialog run build
+#Environment=DIALOG_UI_DIST_DIR=dialog/dist/public
+
+# Секреты и параметры LLM: OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL,
+# OPENAI_TIMEOUT_SECONDS, CORS_ORIGINS, YANDEX_SEARCH_API_KEY,
+# YANDEX_SEARCH_FOLDER_ID, DIALOG_SESSIONS_DIR и т.д.
+EnvironmentFile=/opt/dialog/.env
+
+ExecStart=/opt/dialog/.venv/bin/python artifacts/api-server/main.py
+
+Restart=on-failure
+RestartSec=5
+
+# Журнал доступен через: journalctl -u dialog-api.service -f
+
+[Install]
+WantedBy=multi-user.target

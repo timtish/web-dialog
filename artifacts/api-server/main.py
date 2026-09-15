@@ -6,15 +6,18 @@ import json
 import logging
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
+from zoneinfo import ZoneInfo
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 
@@ -28,6 +31,99 @@ CODE_RE = re.compile(r"^[A-Za-z0-9]{6}$")
 MAX_BOOKMARKS = 10
 MAX_PROMPT_WORDS = 500
 BOOKMARK_CREATION_COOLDOWN_SECONDS = 60
+DEFAULT_BOOKMARK_ID = "default"
+DEFAULT_BOOKMARK_NAME = "Просто спросить"
+DEFAULT_BOOKMARK_ICON = "🌿"
+MAX_HISTORY_MESSAGES = 60
+MAX_SEARCH_ROUNDS = 2
+MAX_SEARCH_SNIPPETS = 5
+
+CHAT_TOOLS: list[dict[str, object]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": (
+                "Поиск в интернете. Вызывай, когда собеседник спрашивает о фактах, "
+                "новостях, погоде, цене, расписании, биографии или другом, что могло "
+                "измениться или о чём ты не знаешь наверняка."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Поисковый запрос на русском языке",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    }
+]
+
+# Агент-создатель собеседников пользуется тем же инструментом поиска.
+CREATOR_TOOLS = CHAT_TOOLS
+
+CREATOR_STATUSES = {
+    "chatter",
+    "created",
+    "clarification_required",
+    "rejected",
+    "not_found",
+}
+
+PROMPTS_DIR = Path(
+    os.getenv("DIALOG_PROMPTS_DIR", "data/prompts")
+)
+
+# Собранный фронтенд раздаётся тем же процессом FastAPI (один порт, один origin).
+# Перед деплоем собрать: PORT=8011 BASE_PATH=/ pnpm --filter @workspace/dialog run build
+DIALOG_UI_DIST_DIR = Path(
+    os.getenv("DIALOG_UI_DIST_DIR", "dialog/dist/public")
+)
+
+GREETING_MORNING_CUTOFF = 11
+GREETING_EVENING_CUTOFF = 17
+
+WEATHER_PRESETS: dict[int, dict[str, str]] = {
+    0: {"summary": "Ясно"},
+    1: {"summary": "Ясно"},
+    2: {"summary": "Переменная облачность"},
+    3: {"summary": "Пасмурно"},
+    45: {"summary": "Туман"},
+    48: {"summary": "Туман"},
+    51: {"summary": "Морось"},
+    53: {"summary": "Морось"},
+    55: {"summary": "Морось"},
+    56: {"summary": "Ледяная морось"},
+    57: {"summary": "Ледяная морось"},
+    61: {"summary": "Дождь"},
+    63: {"summary": "Дождь"},
+    65: {"summary": "Дождь"},
+    66: {"summary": "Ледяной дождь"},
+    67: {"summary": "Ледяной дождь"},
+    71: {"summary": "Снег"},
+    73: {"summary": "Снег"},
+    75: {"summary": "Снег"},
+    77: {"summary": "Снежные зёрна"},
+    80: {"summary": "Ливень"},
+    81: {"summary": "Ливень"},
+    82: {"summary": "Ливень"},
+    85: {"summary": "Снегопад"},
+    86: {"summary": "Снегопад"},
+    95: {"summary": "Гроза"},
+    96: {"summary": "Гроза"},
+    99: {"summary": "Гроза"},
+}
+
+SAMARA_PLACE = "Самара"
+SAMARA_LATITUDE = os.getenv("WEATHER_LATITUDE", "53.195873")
+SAMARA_LONGITUDE = os.getenv("WEATHER_LONGITUDE", "50.100193")
+SAMARA_TIMEZONE = os.getenv("WEATHER_TIMEZONE", "Europe/Samara")
+
+HOROSCOPE_SEARCH_QUERY = "гороскоп на сегодня"
+
 DEFAULT_SYSTEM_PROMPT = """Ты — доброжелательный собеседник для пожилого человека.
 Говори по-русски, тепло и простыми словами. Отвечай коротко, без сложных терминов,
 и задавай один естественный открытый вопрос, когда это уместно.
@@ -35,14 +131,67 @@ DEFAULT_SYSTEM_PROMPT = """Ты — доброжелательный собес�
 абстиненции, суицидальных мыслях или резком ухудшении здоровья, спокойно посоветуй
 обратиться к близкому человеку или вызвать скорую помощь. Не изображай врача."""
 DEFAULT_DAILY_THOUGHT = "«Хороший разговор — это тоже прогулка»"
-DEFAULT_BOOKMARK_ID = "default"
-DEFAULT_BOOKMARK_NAME = "Просто спросить"
-DEFAULT_BOOKMARK_ICON = "🌿"
 UNIVERSAL_CHARACTER_SAFETY = """## Общая безопасность
 - Не поощряй алкоголь, наркотики, насилие или самоповреждение.
 - Если разговор касается алкоголя или наркотиков, мягко отговаривай и предлагай безопасную альтернативу.
 - Не романтизируй зависимость, насилие, суицид или раннюю смерть.
-- Если человек сообщает об угрозе жизни или резком ухудшении здоровья, спокойно посоветуй обратиться к близкому человеку, врачу или вызвать скорую помощь."""
+- Если человек сообщает об угрозе жизни или резком ухудшении здоровья, спокойно посоветуй обратиться к близкому человеку, врачу или вызвать скорую помощь. объясни почему это важно."""
+
+# Резервный промпт агента-создателя, если data/prompts/creator.md недоступен.
+CREATOR_FALLBACK_PROMPT = """Ты — помощник в общем диалоге с пожилым человеком.
+У тебя две роли, и ты сам выбираешь роль по сообщению собеседника: тёплый
+собеседник, если человек хочет просто поговорить, и создатель собеседников,
+если человек описывает, с кем хочет поговорить. Ты не притворяешься персонажем,
+которого создаёшь.
+
+Всегда отвечай ровно одним JSON-объектом без Markdown-обёртки:
+- обычный разговор: {"status": "chatter", "user_message": "<твой тёплый ответ>"}
+- собеседник создан: {"status": "created", "name": "<короткое имя>", "icon": "<эмодзи>", "user_message": "<1-3 тёплых предложения>", "prompt_markdown": "<готовый системный промпт собеседника, 150-350 слов>"}
+- нужно уточнение: {"status": "clarification_required", "user_message": "<один-два коротких вопроса>"}
+- создать нельзя: {"status": "rejected", "user_message": "<мягкий отказ и безопасная альтернатива>"}
+- человека не удалось найти: {"status": "not_found", "user_message": "<попроси уточнить имя или рассказать, чем он известен>"}
+
+Можно создавать: публичных исторических личностей и умерших деятелей культуры,
+вымышленных персонажей, обобщённые образы (старый рыбак, сельский учитель,
+сосед по даче) и собеседников, описанных через манеру разговора. Для живых
+публичных людей создавай условную художественную интерпретацию, а не копию
+личности. Нельзя создавать собеседника от имени родных, знакомых и частных
+лиц — предложи помочь вспомнить человека, поговорить о нём или составить
+сообщение. Не создавай «собутыльника» и персонажей, подталкивающих к выпивке.
+
+Если названа публичная личность — используй инструмент search, чтобы проверить
+имя, годы жизни, род деятельности и произведения. Не включай в промпт слухи и
+выдуманные факты. Если человека не удалось надёжно найти — верни not_found.
+
+Говори простыми словами, короткими абзацами, без нотаций. При обычном разговоре
+задавай один естественный открытый вопрос, когда это уместно. Не осуждай и не
+читай нотации. Если человек сообщает об угрозе жизни или тяжёлом состоянии,
+спокойно посоветуй обратиться к близкому человеку или вызвать скорую помощь."""
+
+CREATOR_SAVED_NOTE = (
+    "Готово! Новый собеседник «{name}» появился в списке справа. "
+    "Наш прежний разговор никуда не делся — можно вернуться и продолжить."
+)
+CREATOR_SWITCHED_NOTE = (
+    "Собеседник сменился на «{name}». Наш прежний разговор сохранён — "
+    "можно вернуться в любой момент."
+)
+
+_PROMPT_FILE_CACHE: dict[str, str] = {}
+
+
+def load_prompt_file(filename: str) -> str | None:
+    """Читает промпт из data/prompts/<filename>; None, если файла нет."""
+    if filename in _PROMPT_FILE_CACHE:
+        return _PROMPT_FILE_CACHE[filename] or None
+    path = PROMPTS_DIR / filename
+    try:
+        content = path.read_text(encoding="utf-8").strip() or None
+    except OSError as error:
+        logger.warning("Could not read prompt file %s: %s", path, error)
+        content = None
+    _PROMPT_FILE_CACHE[filename] = content or ""
+    return content
 
 
 class Settings:
@@ -53,11 +202,18 @@ class Settings:
         ).rstrip("/")
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
         self.openai_timeout = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "45"))
-        self.system_prompt = os.getenv(
-            "PAPA_BOT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT
-        ).strip()
+        # Приоритет: переменная окружения -> data/prompts/default.md -> константа.
+        self.system_prompt = (
+            os.getenv("DIALOG_SYSTEM_PROMPT", "").strip()
+            or load_prompt_file("default.md")
+            or DEFAULT_SYSTEM_PROMPT
+        )
+        self.character_safety_prompt = (
+            load_prompt_file("character_safety.md")
+            or UNIVERSAL_CHARACTER_SAFETY
+        )
         self.sessions_dir = Path(
-            os.getenv("PAPA_BOT_SESSIONS_DIR", "data/sessions")
+            os.getenv("DIALOG_SESSIONS_DIR", "data/sessions")
         )
         self.cors_origins = [
             origin.strip()
@@ -75,6 +231,11 @@ class Settings:
         self.yandex_search_timeout = float(
             os.getenv("YANDEX_SEARCH_TIMEOUT_SECONDS", "20")
         )
+        self.horoscope_search_timeout = float(
+            os.getenv("HOROSCOPE_SEARCH_TIMEOUT_SECONDS", "20")
+        )
+        self.prompts_dir = PROMPTS_DIR
+        self.dialog_ui_dist_dir = DIALOG_UI_DIST_DIR
 
 
 settings = Settings()
@@ -92,12 +253,20 @@ class DialogResponse(BaseModel):
     messages: list[DialogMessage]
 
 
+class Greeting(BaseModel):
+    text: str
+    time_of_day: Literal["утро", "день", "вечер", "ночь"]
+
+
+class WeatherResponse(BaseModel):
+    temperature: float
+    summary: str
+    place: str
+    updated_at: datetime
+
+
 class SendMessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
-
-
-class SendMessageResponse(DialogResponse):
-    reply: str
 
 
 class Bookmark(BaseModel):
@@ -106,6 +275,11 @@ class Bookmark(BaseModel):
     icon: str
     prompt_file: str | None = None
     created_at: datetime
+
+
+class SendMessageResponse(DialogResponse):
+    reply: str
+    created_bookmark: Bookmark | None = None
 
 
 class BookmarksState(BaseModel):
@@ -118,6 +292,10 @@ class BookmarksResponse(BaseModel):
     bookmarks: list[Bookmark]
     active: str
     thought: str | None = None
+
+
+class HoroscopeResponse(BaseModel):
+    horoscope: str
 
 
 class CreateBookmarkRequest(BaseModel):
@@ -134,6 +312,14 @@ class ActivateBookmarkResponse(BookmarksResponse):
 
 class DeleteBookmarkResponse(BookmarksResponse):
     deleted: bool
+
+
+class CreatorOutcome(NamedTuple):
+    status: str
+    user_message: str
+    name: str = ""
+    icon: str = ""
+    prompt_markdown: str = ""
 
 
 class SessionStore:
@@ -301,6 +487,57 @@ class MissingYandexSearchConfigError(RuntimeError):
 
 
 class OpenAIClient:
+    async def _chat(
+        self,
+        request_messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        body: dict[str, object] = {
+            "model": settings.openai_model,
+            "messages": request_messages,
+            "temperature": 0.7,
+        }
+        if tools:
+            body["tools"] = tools
+        try:
+            async with httpx.AsyncClient(timeout=settings.openai_timeout) as client:
+                response = await client.post(
+                    f"{settings.openai_base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.openai_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPError as error:
+            logger.exception("OpenAI request failed: %s", error)
+            raise HTTPException(
+                status_code=502,
+                detail="Собеседник сейчас не отвечает. Попробуйте ещё раз.",
+            ) from error
+
+    async def chat(
+        self,
+        request_messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        payload = await self._chat(request_messages, tools=tools)
+        choices = payload.get("choices")
+        message = (
+            choices[0].get("message", {})
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+            else {}
+        )
+        if not isinstance(message, dict) or not message:
+            logger.error("Unexpected OpenAI response shape")
+            raise HTTPException(
+                status_code=502,
+                detail="Собеседник вернул неполный ответ. Попробуйте ещё раз.",
+            )
+        return message
+
     async def complete(
         self,
         messages: list[DialogMessage],
@@ -319,39 +556,9 @@ class OpenAIClient:
                 for message in messages
             ],
         ]
+        message = await self.chat(request_messages)
 
-        try:
-            async with httpx.AsyncClient(timeout=settings.openai_timeout) as client:
-                response = await client.post(
-                    f"{settings.openai_base_url}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.openai_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": settings.openai_model,
-                        "messages": request_messages,
-                        "temperature": 0.7,
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
-        except httpx.HTTPError as error:
-            logger.exception("OpenAI request failed: %s", error)
-            raise HTTPException(
-                status_code=502,
-                detail="Собеседник сейчас не отвечает. Попробуйте ещё раз.",
-            ) from error
-
-        try:
-            reply = payload["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as error:
-            logger.error("Unexpected OpenAI response shape")
-            raise HTTPException(
-                status_code=502,
-                detail="Собеседник вернул неполный ответ. Попробуйте ещё раз.",
-            ) from error
-
+        reply = message.get("content")
         if not isinstance(reply, str) or not reply.strip():
             raise HTTPException(
                 status_code=502,
@@ -432,7 +639,7 @@ def extract_search_context(raw_data: str) -> str:
     )
 
     entries: list[str] = []
-    for index, url in enumerate(urls[:5]):
+    for index, url in enumerate(urls[:MAX_SEARCH_SNIPPETS]):
         title = clean_markup(titles[index]) if index < len(titles) else ""
         snippet = clean_markup(snippets[index]) if index < len(snippets) else ""
         cleaned_url = clean_markup(url)
@@ -443,6 +650,84 @@ def extract_search_context(raw_data: str) -> str:
     if entries:
         return "\n".join(f"- {entry}" for entry in entries)[:12000]
     return clean_markup(raw_data)[:12000]
+
+
+class WeatherClient:
+    """Открытый API open-meteo без ключей: погода в Самаре."""
+
+    async def fetch_current_weather(self) -> WeatherResponse:
+        params = {
+            "latitude": SAMARA_LATITUDE,
+            "longitude": SAMARA_LONGITUDE,
+            "current": "temperature_2m,weather_code",
+            "timezone": SAMARA_TIMEZONE,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params=params,
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            logger.exception("Open-Meteo request failed: %s", error)
+            raise HTTPException(
+                status_code=502,
+                detail="Не удалось узнать погоду в Самаре.",
+            ) from error
+
+        current = payload.get("current") or {}
+        temperature = current.get("temperature_2m")
+        weather_code = current.get("weather_code")
+        updated_at = current.get("time")
+        if not isinstance(temperature, (int, float)) or not isinstance(
+            weather_code, int
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail="Погода в Самаре вернулась в неожиданном формате.",
+            )
+
+        preset = WEATHER_PRESETS.get(
+            weather_code, {"summary": "Погода проясняется"}
+        )
+        return WeatherResponse(
+            temperature=float(temperature),
+            summary=str(preset["summary"]),
+            place=SAMARA_PLACE,
+            updated_at=updated_at or datetime.now(UTC),
+        )
+
+
+class HoroscopeClient:
+    """Сводка через Яндекс-поиск + обработка LLM (промпт из data/prompts)."""
+
+    async def fetch_horoscope(self) -> str:
+        raw_data = await yandex_search_client.search(HOROSCOPE_SEARCH_QUERY)
+        summary = clean_markup(raw_data)[:4000]
+        prompt = load_prompt_file("horoscope.md")
+
+        if not prompt:
+            return summary[:400] or DEFAULT_DAILY_THOUGHT
+
+        try:
+            return await openai_client.complete(
+                [
+                    DialogMessage(
+                        id="horoscope-request",
+                        role="user",
+                        content=summary,
+                        created_at=datetime.now(UTC),
+                    )
+                ],
+                system_prompt=prompt,
+            )
+        except MissingOpenAIKeyError:
+            logger.warning(
+                "Horoscope: OPENAI_API_KEY не задан, возвращаю сырую сводку."
+            )
+            return summary[:400] or DEFAULT_DAILY_THOUGHT
 
 
 def parse_json_object(raw_text: str) -> dict[str, object]:
@@ -485,6 +770,15 @@ def active_prompt(code: str, state: BookmarksState) -> str:
     return store.load_prompt(code, bookmark.prompt_file)
 
 
+def creator_mode_active(state: BookmarksState) -> bool:
+    """Режим агента-создателя включён, пока активен встроенный собеседник."""
+    bookmark = next(
+        (item for item in state.bookmarks if item.id == state.active_bookmark),
+        None,
+    )
+    return bookmark is None or bookmark.id == DEFAULT_BOOKMARK_ID or not bookmark.prompt_file
+
+
 def bookmarks_response(
     state: BookmarksState,
     thought: str | None = None,
@@ -518,10 +812,13 @@ async def generate_character_thought(code: str, state: BookmarksState) -> str:
 
 
 async def moderate_description(description: str) -> None:
-    moderation_prompt = """Ты — строгий модератор описаний персонажей для безопасного дружеского чата.
+    moderation_prompt = (
+        load_prompt_file("creator_moderation.md")
+        or """Ты — строгий модератор описаний персонажей для безопасного дружеского чата.
 Проверь описание на просьбы романтизировать или поощрять алкоголь, наркотики, насилие,
 суицид или самоповреждение. Верни только одно слово: ALLOW или REJECT.
 Безопасные упоминания исторических фактов и просьбы мягко отговаривать от опасного поведения разрешены."""
+    )
     try:
         result = await openai_client.complete(
             [
@@ -551,7 +848,14 @@ async def generate_character_prompt(
     description: str,
     search_context: str,
 ) -> tuple[str, str, str]:
-    generation_prompt = f"""Создай system prompt для безопасного ИИ-собеседника.
+    generation_template = load_prompt_file("creator_generation.md")
+    if generation_template:
+        generation_prompt = generation_template.format(
+            description=description,
+            search_context=search_context,
+        )
+    else:
+        generation_prompt = f"""Создай system prompt для безопасного ИИ-собеседника.
 Описание пользователя:
 {description}
 
@@ -601,13 +905,287 @@ System prompt должен быть 200–300 слов: опиши роль, т�
             detail="Настройки нового собеседника получились слишком длинными.",
         )
     if "## Общая безопасность" not in prompt:
-        prompt = f"{prompt}\n\n{UNIVERSAL_CHARACTER_SAFETY}"
+        prompt = f"{prompt}\n\n{settings.character_safety_prompt}"
     return name, icon, prompt
 
 
 store = SessionStore(settings.sessions_dir)
 openai_client = OpenAIClient()
 yandex_search_client = YandexSearchClient()
+weather_client = WeatherClient()
+horoscope_client = HoroscopeClient()
+
+
+def to_llm_messages(
+    messages: list[DialogMessage],
+    system_prompt: str,
+) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": system_prompt},
+        *[
+            {"role": message.role, "content": message.content}
+            for message in messages
+        ],
+    ]
+
+
+def extract_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return []
+    return [call for call in tool_calls if isinstance(call, dict)]
+
+
+async def execute_search_tool(call: dict[str, object]) -> str:
+    function = call.get("function") or {}
+    if not isinstance(function, dict):
+        return "Не удалось разобрать запрос на поиск."
+    arguments_raw = function.get("arguments")
+    try:
+        arguments = (
+            json.loads(arguments_raw)
+            if isinstance(arguments_raw, str)
+            else dict(arguments_raw or {})
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        logger.warning("Could not parse search tool arguments: %s", error)
+        return "Не удалось разобрать запрос на поиск."
+
+    query = str(arguments.get("query", "")).strip()
+    if not query:
+        return "Не удалось разобрать запрос на поиск."
+
+    logger.info("Search tool query: %s", query)
+    return await yandex_search_client.search(query)
+
+
+async def chat_reply(
+    context: list[DialogMessage],
+    system_prompt: str,
+) -> str:
+    request_messages = to_llm_messages(context, system_prompt)
+
+    message: dict[str, object] = {}
+    for _ in range(MAX_SEARCH_ROUNDS):
+        message = await openai_client.chat(request_messages, tools=CHAT_TOOLS)
+        tool_calls = extract_tool_calls(message)
+        if not tool_calls:
+            break
+
+        request_messages.append(message)
+        for call in tool_calls:
+            call_id = str(call.get("id") or "call")
+            try:
+                result = await execute_search_tool(call)
+            except MissingYandexSearchConfigError:
+                result = "Поиск в интернете сейчас недоступен."
+            except HTTPException as error:
+                result = f"Поиск не удался: {error.detail}"
+            request_messages.append(
+                {"role": "tool", "tool_call_id": call_id, "content": result}
+            )
+
+    reply = message.get("content")
+    if not isinstance(reply, str) or not reply.strip():
+        raise HTTPException(
+            status_code=502,
+            detail="Собеседник вернул пустой ответ. Попробуйте ещё раз.",
+        )
+    return reply.strip()
+
+
+# --------------------------------------------------------------------------
+# Агент-создатель собеседников (промпт: data/prompts/creator.md).
+# Работает в общем диалоге, пока активен встроенный собеседник.
+# --------------------------------------------------------------------------
+
+
+def parse_creator_outcome(raw_reply: str) -> CreatorOutcome:
+    """Разбирает ответ агента; при сбое JSON считается обычным разговором."""
+    cleaned = raw_reply.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            payload = json.loads(cleaned[start : end + 1])
+            if isinstance(payload, dict):
+                return _creator_outcome_from_payload(payload, cleaned.strip())
+        except json.JSONDecodeError as error:
+            logger.warning("Creator reply is not valid JSON: %s", error)
+    return CreatorOutcome(status="chatter", user_message=cleaned.strip())
+
+
+def _creator_outcome_from_payload(
+    payload: dict[str, object],
+    raw_reply: str,
+) -> CreatorOutcome:
+    status = str(payload.get("status", "chatter")).strip().lower()
+    if status not in CREATOR_STATUSES:
+        status = "chatter"
+    user_message = str(payload.get("user_message", "")).strip()
+    name = str(payload.get("name", "")).strip()[:80]
+    icon = str(payload.get("icon", "✨")).strip()[:4] or "✨"
+    prompt_markdown = str(payload.get("prompt_markdown", "")).strip()
+
+    if status == "created" and (not name or not prompt_markdown):
+        # Модель не передала обязательные поля — считаем ответ обычной репликой.
+        logger.warning("Creator payload missing name or prompt_markdown")
+        status = "chatter"
+        prompt_markdown = ""
+
+    if not user_message:
+        user_message = (
+            raw_reply
+            if status == "chatter"
+            else "Расскажи, пожалуйста, чуть подробнее, с кем хочешь поговорить."
+        )
+
+    return CreatorOutcome(
+        status=status,
+        user_message=user_message,
+        name=name,
+        icon=icon,
+        prompt_markdown=prompt_markdown,
+    )
+
+
+def creator_system_prompt(state: BookmarksState) -> str:
+    base = load_prompt_file("creator.md") or CREATOR_FALLBACK_PROMPT
+    existing = ", ".join(
+        f"«{bookmark.name}»"
+        for bookmark in state.bookmarks
+        if bookmark.id != DEFAULT_BOOKMARK_ID
+    ) or "пока никаких"
+    return (
+        f"{base}\n\n"
+        "## Контекст этой сессии\n"
+        f"- Уже созданные собеседники: {existing}. Не создавай дубликат — "
+        "предложи просто переключиться на существующего.\n"
+        "- Новый собеседник сохраняется в общий список справа. Прежний диалог "
+        "пользователя при этом не пропадает: он остаётся в общем разговоре, и "
+        "к нему всегда можно вернуться. Когда собеседник создан, скажи об этом "
+        "одним тёплым предложением.\n"
+        "- Один запрос на создание за раз: не создавай нескольких собеседников "
+        "из одного сообщения. Если просят несколько — предложи начать с одного."
+    )
+
+
+async def creator_reply(
+    context: list[DialogMessage],
+    system_prompt: str,
+) -> CreatorOutcome:
+    request_messages = to_llm_messages(context, system_prompt)
+
+    message: dict[str, object] = {}
+    for _ in range(MAX_SEARCH_ROUNDS):
+        message = await openai_client.chat(request_messages, tools=CREATOR_TOOLS)
+        tool_calls = extract_tool_calls(message)
+        if not tool_calls:
+            break
+
+        request_messages.append(message)
+        for call in tool_calls:
+            call_id = str(call.get("id") or "call")
+            try:
+                result = await execute_search_tool(call)
+            except MissingYandexSearchConfigError:
+                result = "Поиск в интернете сейчас недоступен."
+            except HTTPException as error:
+                result = f"Поиск не удался: {error.detail}"
+            request_messages.append(
+                {"role": "tool", "tool_call_id": call_id, "content": result}
+            )
+
+    raw_reply = message.get("content")
+    if not isinstance(raw_reply, str) or not raw_reply.strip():
+        raise HTTPException(
+            status_code=502,
+            detail="Собеседник вернул пустой ответ. Попробуйте ещё раз.",
+        )
+    return parse_creator_outcome(raw_reply.strip())
+
+
+def _persist_created_bookmark(
+    normalized_code: str,
+    state: BookmarksState,
+    outcome: CreatorOutcome,
+) -> Bookmark:
+    """Сохраняет промпт нового собеседника в файл и добавляет его в список."""
+    if len(state.bookmarks) >= MAX_BOOKMARKS:
+        raise HTTPException(
+            status_code=400,
+            detail="Можно создать не больше десяти собеседников.",
+        )
+
+    now = datetime.now(UTC)
+    if state.last_created_at:
+        seconds_since_creation = (
+            now - state.last_created_at
+        ).total_seconds()
+        if seconds_since_creation < BOOKMARK_CREATION_COOLDOWN_SECONDS:
+            wait_seconds = max(
+                1,
+                int(BOOKMARK_CREATION_COOLDOWN_SECONDS - seconds_since_creation),
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=f"Новый собеседник будет доступен через {wait_seconds} сек.",
+            )
+
+    prompt_markdown = outcome.prompt_markdown.strip()
+    if prompt_word_count(prompt_markdown) > MAX_PROMPT_WORDS:
+        raise HTTPException(
+            status_code=502,
+            detail="Настройки нового собеседника получились слишком длинными. Попробуйте ещё раз.",
+        )
+    if "## Общая безопасность" not in prompt_markdown:
+        prompt_markdown = f"{prompt_markdown}\n\n{settings.character_safety_prompt}"
+
+    index = 1
+    used_files = {
+        bookmark.prompt_file
+        for bookmark in state.bookmarks
+        if bookmark.prompt_file
+    }
+    while f"prompts/персонаж_{index:02d}.md" in used_files:
+        index += 1
+
+    bookmark = Bookmark(
+        id=f"character-{index:02d}",
+        name=outcome.name[:80] or "Новый собеседник",
+        icon=outcome.icon[:4] or "✨",
+        prompt_file=f"prompts/персонаж_{index:02d}.md",
+        created_at=now,
+    )
+    store.save_prompt(
+        normalized_code,
+        f"персонаж_{index:02d}.md",
+        f"# {bookmark.name}\n\n{prompt_markdown}\n",
+    )
+    state.bookmarks.append(bookmark)
+    state.last_created_at = now
+    store.save_bookmarks(normalized_code, state)
+    return bookmark
+
+
+async def handle_creator_turn(
+    normalized_code: str,
+    context: list[DialogMessage],
+    state: BookmarksState,
+) -> tuple[str, Bookmark | None]:
+    """Обрабатывает сообщение в режиме агента-создателя."""
+    outcome = await creator_reply(context, creator_system_prompt(state))
+
+    if outcome.status != "created":
+        return outcome.user_message, None
+
+    bookmark = _persist_created_bookmark(normalized_code, state, outcome)
+    return (
+        f"{CREATOR_SAVED_NOTE.format(name=bookmark.name)} {outcome.user_message}",
+        bookmark,
+    )
 
 
 def normalize_code(raw_code: str) -> str:
@@ -627,9 +1205,15 @@ def response_for(code: str, messages: list[DialogMessage]) -> DialogResponse:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings.sessions_dir.mkdir(parents=True, exist_ok=True)
+    if not load_prompt_file("creator.md"):
+        logger.warning(
+            "Prompt file %s not found — using built-in creator prompt.",
+            settings.prompts_dir / "creator.md",
+        )
     logger.info(
-        "Dialog API started with sessions=%s model=%s openai_configured=%s",
+        "Dialog API started with sessions=%s prompts=%s model=%s openai_configured=%s",
         settings.sessions_dir,
+        settings.prompts_dir,
         settings.openai_model,
         bool(settings.openai_api_key),
     )
@@ -655,6 +1239,62 @@ async def healthz() -> dict[str, str | bool]:
             settings.yandex_search_api_key and settings.yandex_search_folder_id
         ),
     }
+
+
+def greeting_time_of_day(now: datetime) -> Literal["утро", "день", "вечер", "ночь"]:
+    hour = now.hour
+    if hour < 5:
+        return "ночь"
+    if hour < GREETING_MORNING_CUTOFF:
+        return "утро"
+    if hour < GREETING_EVENING_CUTOFF:
+        return "день"
+    return "вечер"
+
+
+def build_greeting_text(time_of_day: str) -> str:
+    if time_of_day == "утро":
+        return "Доброе утро!"
+    if time_of_day == "день":
+        return "Добрый день!"
+    if time_of_day == "вечер":
+        return "Добрый вечер!"
+    return "Доброй ночи!"
+
+
+@app.get(
+    "/api/greeting",
+    response_model=Greeting,
+)
+async def get_greeting() -> Greeting:
+    now = datetime.now(ZoneInfo(SAMARA_TIMEZONE))
+    time_of_day = greeting_time_of_day(now)
+    return Greeting(text=build_greeting_text(time_of_day), time_of_day=time_of_day)
+
+
+@app.get(
+    "/api/weather",
+    response_model=WeatherResponse,
+)
+async def get_weather() -> WeatherResponse:
+    return await weather_client.fetch_current_weather()
+
+
+@app.get(
+    "/api/horoscope",
+    response_model=HoroscopeResponse,
+)
+async def get_horoscope() -> HoroscopeResponse:
+    try:
+        horoscope = await horoscope_client.fetch_horoscope()
+    except MissingYandexSearchConfigError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Гороскоп пока недоступен: не настроен поиск.",
+        ) from error
+    except HTTPException:
+        raise
+    return HoroscopeResponse(horoscope=horoscope)
 
 
 @app.get(
@@ -692,6 +1332,11 @@ async def create_bookmark(
     request: CreateBookmarkRequest,
     code: str = PathParam(...),
 ) -> CreateBookmarkResponse:
+    """Прямое создание собеседника по описанию (без диалога с агентом).
+
+    Промпт нового собеседника сохраняется в новый файл внутри сессии:
+    data/sessions/{code}/prompts/персонаж_NN.md.
+    """
     normalized_code = normalize_code(code)
     description = request.description.strip()
     if len(description) < 3:
@@ -732,31 +1377,17 @@ async def create_bookmark(
             search_context,
         )
 
-        index = 1
-        used_files = {
-            bookmark.prompt_file
-            for bookmark in state.bookmarks
-            if bookmark.prompt_file
-        }
-        while f"prompts/персонаж_{index:02d}.md" in used_files:
-            index += 1
-
-        bookmark = Bookmark(
-            id=f"character-{index:02d}",
-            name=name,
-            icon=icon,
-            prompt_file=f"prompts/персонаж_{index:02d}.md",
-            created_at=now,
-        )
-        prompt_markdown = f"# {name}\n\n{prompt}\n"
-        store.save_prompt(
+        bookmark = _persist_created_bookmark(
             normalized_code,
-            f"персонаж_{index:02d}.md",
-            prompt_markdown,
+            state,
+            CreatorOutcome(
+                status="created",
+                user_message="",
+                name=name,
+                icon=icon,
+                prompt_markdown=prompt,
+            ),
         )
-        state.bookmarks.append(bookmark)
-        state.last_created_at = now
-        store.save_bookmarks(normalized_code, state)
 
     return CreateBookmarkResponse(
         **bookmarks_response(state, DEFAULT_DAILY_THOUGHT).model_dump(),
@@ -788,12 +1419,12 @@ async def activate_bookmark(
         next_state = state.model_copy(update={"active_bookmark": target.id})
         thought = await generate_character_thought(normalized_code, next_state)
         messages = store.load(normalized_code)
-        if state.active_bookmark != target.id:
+        if state.active_bookmark != target.id and target.id != DEFAULT_BOOKMARK_ID:
             messages.append(
                 DialogMessage(
                     id=f"system-{datetime.now(UTC).timestamp()}",
                     role="system",
-                    content=f'Собеседник сменился на «{target.name}». Продолжайте разговор.',
+                    content=CREATOR_SWITCHED_NOTE.format(name=target.name),
                     created_at=datetime.now(UTC),
                 )
             )
@@ -876,11 +1507,21 @@ async def send_message(
         )
         context = [*existing_messages, user_message]
 
+        created_bookmark: Bookmark | None = None
         try:
-            reply = await openai_client.complete(
-                context,
-                system_prompt=active_prompt(normalized_code, bookmark_state),
-            )
+            if creator_mode_active(bookmark_state):
+                # Общий диалог ведёт агент-создатель: он болтает, уточняет
+                # и создаёт собеседников. Старая история при этом сохраняется.
+                reply, created_bookmark = await handle_creator_turn(
+                    normalized_code,
+                    context,
+                    bookmark_state,
+                )
+            else:
+                reply = await chat_reply(
+                    context,
+                    active_prompt(normalized_code, bookmark_state),
+                )
         except MissingOpenAIKeyError as error:
             raise HTTPException(
                 status_code=503,
@@ -894,13 +1535,65 @@ async def send_message(
             created_at=datetime.now(UTC),
         )
         updated_messages = [*context, assistant_message]
+        if created_bookmark is not None:
+            updated_messages.append(
+                DialogMessage(
+                    id=f"system-{datetime.now(UTC).timestamp()}",
+                    role="system",
+                    content=(
+                        "Новый собеседник добавлен. Прежний разговор сохранён — "
+                        "можно вернуться в любой момент."
+                    ),
+                    created_at=datetime.now(UTC),
+                )
+            )
         store.save(normalized_code, updated_messages)
 
     return SendMessageResponse(
         code=normalized_code,
         reply=reply,
         messages=updated_messages,
+        created_bookmark=created_bookmark,
     )
+
+
+# --------------------------------------------------------------------------
+# Раздача собранного фронтенда (artifacts/dialog/dist/public) тем же процессом.
+# Маршрут регистрируется последним, чтобы не перехватывать /api/* и /docs.
+# --------------------------------------------------------------------------
+
+
+def _safe_static_path(relative_path: str) -> Path | None:
+    """Возвращает файл внутри DIALOG_UI_DIST_DIR или None (защита от ../)."""
+    dist_dir = DIALOG_UI_DIST_DIR.resolve()
+    candidate = (dist_dir / relative_path).resolve()
+    if candidate == dist_dir or dist_dir not in candidate.parents:
+        return None
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_spa(full_path: str) -> FileResponse:
+    index_html = DIALOG_UI_DIST_DIR / "index.html"
+
+    if not index_html.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Фронтенд не собран. Выполните: "
+                "PORT=8011 BASE_PATH=/ pnpm --filter @workspace/dialog run build"
+            ),
+        )
+
+    static_file = _safe_static_path(full_path)
+    if static_file is not None:
+        return FileResponse(static_file)
+
+    # SPA-fallback: /dialog/smr001 и любые неизвестные пути отдают index.html,
+    # роутинг (wouter) разберёт адрес на клиенте.
+    return FileResponse(index_html)
 
 
 if __name__ == "__main__":

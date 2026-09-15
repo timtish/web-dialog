@@ -250,7 +250,7 @@
 .conversation-log {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 4px;
   margin-top: 48px;
 }
 
@@ -288,8 +288,23 @@
   border-radius: 12px 12px 4px 12px;
 }
 
+.message-side {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 62px;
+  align-items: center;
+}
+
+.message-side .message-meta {
+  margin-top: 0;
+  text-align: center;
+  white-space: nowrap;
+}
+
 .message-bubble {
-  max-width: min(570px, calc(100% - 48px));
+  max-width: min(570px, calc(100% - 136px));
   padding: 16px 18px;
   border: 1px solid rgba(77, 104, 91, .12);
   border-radius: 5px 18px 18px 18px;
@@ -380,7 +395,7 @@
   align-items: flex-end;
   gap: 10px;
   padding: 8px 8px 8px 18px;
-  border: 1px solid rgba(74, 102, 88, .2);
+  border: 1px solid rgba(74, 102, 88, .7);
   border-radius: 21px;
   background: rgba(247, 244, 233, .91);
   box-shadow: 0 16px 36px rgba(48, 72, 61, .11);
@@ -964,6 +979,12 @@
   .avatar {
     width: 31px;
     height: 31px;
+  }
+  .message-side {
+    min-width: 52px;
+  }
+  .message-bubble {
+    max-width: min(570px, calc(100% - 116px));
   }
   .composer {
     padding-left: 14px;
