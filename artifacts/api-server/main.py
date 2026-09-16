@@ -2234,10 +2234,7 @@ async def serve_spa(full_path: str) -> FileResponse:
     if not index_html.is_file():
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Фронтенд не собран. Выполните: "
-                "PORT=8011 BASE_PATH=/ pnpm --filter @workspace/dialog run build"
-            ),
+            detail="Фронтенд не собран " + index_html,
         )
 
     static_file = _safe_static_path(full_path)
