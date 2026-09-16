@@ -488,7 +488,7 @@ function Home() {
 
   const handleActivateBookmark = async (
     bookmarkId: string,
-    options: { allowSame?: boolean } = {},
+    options: { allowSame?: boolean; uiAction?: boolean } = {},
   ) => {
     if (isSwitchingBookmark) return;
     if (bookmarkId === activeBookmark && !options.allowSame) return;
@@ -496,8 +496,13 @@ function Home() {
     setBookmarkError('');
     setIsSwitchingBookmark(bookmarkId);
     try {
+      // ui_action=true — только клик по собеседнику в списке: он гасит режим
+      // создания. Программное переключение на default (кнопка «Добавить
+      // нового») флаг не передаёт, иначе бэкенд сразу выключит только что
+      // запущенную сессию создания.
+      const uiAction = options.uiAction ?? true;
       const response = await fetch(
-        `/api/bookmarks/${encodeURIComponent(code)}/${encodeURIComponent(bookmarkId)}?ui_action=true`,
+        `/api/bookmarks/${encodeURIComponent(code)}/${encodeURIComponent(bookmarkId)}?ui_action=${uiAction}`,
         { method: 'PUT' },
       );
       const payload = (await response.json()) as BookmarksPayload & {
@@ -552,7 +557,10 @@ function Home() {
         );
         return;
       }
-      await handleActivateBookmark(DEFAULT_BOOKMARK_ID, { allowSame: true });
+      await handleActivateBookmark(DEFAULT_BOOKMARK_ID, {
+        allowSame: true,
+        uiAction: false,
+      });
       setMessages((current) =>
         current.some((message) => message.id === CREATOR_PROMPT_ID)
           ? current
