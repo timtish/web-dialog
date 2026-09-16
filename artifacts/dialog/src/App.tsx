@@ -91,6 +91,9 @@ const DEFAULT_BOOKMARK_ID = 'default';
 const DEFAULT_BOOKMARK_NAME = 'Просто спросить';
 const DEFAULT_BOOKMARK_DESCRIPTION = 'Начать обычный разговор';
 const COMPOSER_PLACEHOLDER = 'Напишите, что на душе...';
+const CREATOR_PROMPT_ID = 'creator-prompt';
+const CREATOR_PROMPT =
+  'Опиши нового собеседника, им может быть поэт, политик или кто-то из повестей известных, например: «Сергей Есенин, поэт, говори поэтично про природу».';
 
 function formatMessageTime(value: string) {
   const date = new Date(value);
@@ -144,7 +147,36 @@ function Home() {
   const [isSwitchingBookmark, setIsSwitchingBookmark] = useState('');
   const [bookmarkError, setBookmarkError] = useState('');
   const [isRefreshingBookmarks, setIsRefreshingBookmarks] = useState(false);
+  const [queueLength, setQueueLength] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const conversationLogRef = useRef<HTMLDivElement>(null);
+  const composerWrapRef = useRef<HTMLDivElement>(null);
+  const sendInFlightRef = useRef(false);
+  const queueRef = useRef<{ text: string; addPending: boolean }[]>([]);
+
+  // Курсор сразу живёт в поле ввода.
+  useEffect(() => {
+    textareaRef.current?.focus();
+  }, []);
+
+  // Когда в диалоге появляется новое сообщение, поджимаем прокрутку так,
+  // чтобы нижняя граница поля ввода совпала с нижней границей окна.
+  useEffect(() => {
+    const log = conversationLogRef.current;
+    const composerWrap = composerWrapRef.current;
+    if (!log || !composerWrap) return;
+
+    // .composer-wrap «липнет» к низу экрана, поэтому его положение в потоке
+    // восстанавливаем по концу лога плюс верхний отступ.
+    const composerMarginTop = parseFloat(getComputedStyle(composerWrap).marginTop) || 0;
+    const composerFlowBottom =
+      log.getBoundingClientRect().bottom + composerMarginTop + composerWrap.offsetHeight;
+    const scrollDelta = composerFlowBottom - window.innerHeight;
+    if (scrollDelta <= 0) return;
+
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    window.scrollBy({ top: scrollDelta, behavior: reduceMotion ? 'auto' : 'smooth' });
+  }, [messages, error, isSending]);
 
   useEffect(() => {
     let cancelled = false;
@@ -299,25 +331,29 @@ function Home() {
     };
   }, []);
 
-  const submitMessage = async (rawText: string, isRetry = false) => {
-    const text = rawText.trim();
-    if (!text || isSending) return;
+  // Обрабатывает очередь сообщений по одной: пока модель отвечает, следующие
+  // сообщения спокойно ждут своей очереди и отправляются автоматически.
+  const processQueue = async () => {
+    if (sendInFlightRef.current) return;
+    const next = queueRef.current.shift();
+    if (!next) return;
 
+    sendInFlightRef.current = true;
     setError('');
-    if (!isRetry) {
+    setIsSending(true);
+    setQueueLength(queueRef.current.length);
+    if (next.addPending) {
       setMessages((current) => [
         ...current,
         {
           id: `pending-${Date.now()}`,
           role: 'user',
-          text,
+          text: next.text,
           time: 'сейчас',
         },
       ]);
-      setDraft('');
     }
     textareaRef.current?.focus();
-    setIsSending(true);
 
     try {
       const response = await fetch(
@@ -325,7 +361,7 @@ function Home() {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text }),
+          body: JSON.stringify({ message: next.text }),
         },
       );
       const payload = (await response.json()) as SendMessagePayload;
@@ -334,20 +370,40 @@ function Home() {
       }
       setMessages(fromApiMessages(payload?.messages ?? []));
       if (payload?.created_bookmark) {
-        // Агент-создатель добавил собеседника прямо в общем диалоге —
-        // подтягиваем обновлённый список справа.
+        // Новый собеседник уже в ответе API — показываем сразу, не дожидаясь
+        // медленного /api/bookmarks (тот ждёт LLM-«мысль» и запаздывает).
+        const created = payload.created_bookmark;
+        setBookmarks((current) =>
+          current.some((bookmark) => bookmark.id === created.id)
+            ? current
+            : [...current, created],
+        );
+        // И параллельно обновляем список из API, когда он подтянется.
         void refreshBookmarks();
       }
     } catch (sendError) {
-      setLastFailedText(text);
+      setLastFailedText(next.text);
       setError(
         sendError instanceof Error
           ? sendError.message
           : 'Собеседник пока не отвечает.',
       );
     } finally {
+      sendInFlightRef.current = false;
       setIsSending(false);
+      void processQueue();
     }
+  };
+
+  // Ставит сообщение в очередь; processQueue запускает (или продолжает) отправку.
+  const submitMessage = (rawText: string, isRetry = false) => {
+    const text = rawText.trim();
+    if (!text) return;
+    queueRef.current.push({ text, addPending: !isRetry });
+    if (!isRetry) {
+      setDraft('');
+    }
+    void processQueue();
   };
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -417,9 +473,49 @@ function Home() {
 
   const handleOpenCreatorMode = () => {
     setBookmarkError('');
-    // Создание собеседника теперь живёт в общем диалоге: переключаемся на
-    // встроенного собеседника «Просто спросить» — история при этом сохраняется.
-    void handleActivateBookmark(DEFAULT_BOOKMARK_ID, { allowSame: true });
+    // Включаем серверную сессию создания (15 минут): в это время общий диалог
+    // ведёт агент-создатель, который болтает, уточняет и создаёт собеседников.
+    const startCreator = async () => {
+      const response = await fetch(
+        `/api/bookmarks/${encodeURIComponent(code)}/creator`,
+        { method: 'POST' },
+      );
+      const payload = (await response.json()) as BookmarksPayload & { detail?: string };
+      if (!response.ok) {
+        throw new Error(payload.detail ?? 'Не удалось включить создание собеседника.');
+      }
+      setBookmarks(payload.bookmarks ?? []);
+    };
+    // Создание собеседника живёт в общем диалоге: переключаемся на встроенного
+    // собеседника «Просто спросить» — история при этом сохраняется.
+    // Подсказку добавляем после переключения: ответ PUT несёт историю диалога
+    // и затёр бы сообщение, добавленное раньше него.
+    void (async () => {
+      try {
+        await startCreator();
+      } catch (creatorError) {
+        setBookmarkError(
+          creatorError instanceof Error
+            ? creatorError.message
+            : 'Не удалось включить создание собеседника.',
+        );
+        return;
+      }
+      await handleActivateBookmark(DEFAULT_BOOKMARK_ID, { allowSame: true });
+      setMessages((current) =>
+        current.some((message) => message.id === CREATOR_PROMPT_ID)
+          ? current
+          : [
+              ...current,
+              {
+                id: CREATOR_PROMPT_ID,
+                role: 'assistant',
+                text: CREATOR_PROMPT,
+                time: 'сейчас',
+              },
+            ],
+      );
+    })();
     textareaRef.current?.focus();
   };
 
@@ -436,7 +532,7 @@ function Home() {
   const avatarLetter = speakerName.trim().charAt(0).toUpperCase() || 'ИИ';
   const composerPlaceholder = isDefaultBookmarkId(activeBookmark)
     ? COMPOSER_PLACEHOLDER
-    : `Напишите ${speakerName}...`;
+    : `Напишите ${speakerName}у...`;
   const emptyGreeting = greeting || 'Добрый день.';
   const emptyHint = isDefaultBookmarkId(activeBookmark)
     ? 'Можно спросить что угодно или попросить создать нового собеседника'
@@ -464,7 +560,12 @@ function Home() {
               Ну что, <em>поговорим?</em>
             </h1>
 
-            <div className="conversation-log" aria-live="polite" data-testid="conversation-log">
+            <div
+              className="conversation-log"
+              aria-live="polite"
+              data-testid="conversation-log"
+              ref={conversationLogRef}
+            >
               {isLoadingHistory && (
                 <div className="empty-note" data-testid="loading-conversation">
                   Загружаю наш разговор...
@@ -515,6 +616,11 @@ function Home() {
                     <i />
                     <i />
                     <i />
+                    {queueLength > 0 && (
+                      <span className="typing-queue" data-testid="queue-count">
+                        +{queueLength} в очереди
+                      </span>
+                    )}
                   </div>
                 </div>
               )}
@@ -539,7 +645,7 @@ function Home() {
               )}
             </div>
 
-            <div className="composer-wrap">
+            <div className="composer-wrap" ref={composerWrapRef}>
               <form className="composer" onSubmit={handleSubmit} data-testid="form-message">
                 <label className="sr-only" htmlFor="message-input">
                   Напишите сообщение
@@ -557,20 +663,22 @@ function Home() {
                   }}
                   placeholder={composerPlaceholder}
                   rows={1}
-                  disabled={isSending}
                   data-testid="input-message"
                 />
                 <button
                   className="send-button"
                   type="submit"
                   aria-label="Отправить сообщение"
-                  disabled={!draft.trim() || isSending}
+                  disabled={!draft.trim()}
                   data-testid="button-send"
                 >
                   <Send size={19} strokeWidth={2.1} />
                 </button>
               </form>
-              <p className="composer-hint">Enter — отправить · Shift + Enter — новая строка</p>
+              <p className="composer-hint">
+                Enter — отправить · Shift + Enter — новая строка
+                {isSending && queueLength > 0 ? ` · В очереди: ${queueLength}` : ''}
+              </p>
             </div>
 
             <section className="starter-section" aria-labelledby="starter-heading">
@@ -654,7 +762,7 @@ function Home() {
                 className="add-bookmark-button"
                 type="button"
                 onClick={handleOpenCreatorMode}
-                disabled={bookmarks.length >= 10 || isLoadingBookmarks}
+                disabled={isLoadingBookmarks}
               >
                 <Plus size={16} strokeWidth={2} aria-hidden="true" />
                 Добавить нового

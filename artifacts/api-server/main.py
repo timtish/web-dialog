@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import logging
@@ -28,13 +29,23 @@ logging.basicConfig(
 logger = logging.getLogger("dialog")
 
 CODE_RE = re.compile(r"^[A-Za-z0-9]{6}$")
-MAX_BOOKMARKS = 10
 MAX_PROMPT_WORDS = 500
 BOOKMARK_CREATION_COOLDOWN_SECONDS = 60
+# Сессия создания собеседника: через это время после нажатия «Добавить нового»
+# режим создания гаснет и агент возвращается к обычному разговору.
+CREATOR_SESSION_TIMEOUT_SECONDS = 15 * 60
 DEFAULT_BOOKMARK_ID = "default"
 DEFAULT_BOOKMARK_NAME = "Просто спросить"
 DEFAULT_BOOKMARK_ICON = "🌿"
 MAX_HISTORY_MESSAGES = 60
+# Сжатие давней истории: первая сводка создаётся, когда история собеседника
+# достигает SUMMARY_THRESHOLD_MESSAGES сообщений; дальше сводка обновляется
+# раз в SUMMARY_STEP_MESSAGES новых сообщений. Сводка хранится в summaries.json
+# и подставляется в system prompt, саму историю она не укорачивает.
+SUMMARY_THRESHOLD_MESSAGES = 20
+SUMMARY_STEP_MESSAGES = 20
+SUMMARY_CHUNK_LIMIT = 120
+SUMMARY_MESSAGE_SNIPPET_LIMIT = 1200
 MAX_SEARCH_ROUNDS = 2
 MAX_SEARCH_SNIPPETS = 5
 
@@ -124,12 +135,22 @@ SAMARA_TIMEZONE = os.getenv("WEATHER_TIMEZONE", "Europe/Samara")
 
 HOROSCOPE_SEARCH_QUERY = "гороскоп на сегодня"
 
+# Прогноз на день без поисковой сводки (поиск не настроен или недоступен).
+HOROSCOPE_WITHOUT_SEARCH_PROMPT = """Ты — тёплый неспешный собеседник для пожилого человека.
+Напиши «прогноз на день» из 1–3 коротких предложений: по-доброму, с лёгким юмором
+и заботой. Один раз естественно упомяни быт или домашнее дело — например, приготовить
+курочку в духовке, сходить в магазин, полить цветы или почитать старую книгу.
+Не обещай денежных выигрышей и не упоминай слова «гороскоп» и «знак зодиака».
+Верни только текст без кавычек, заголовков и пояснений."""
+
 DEFAULT_SYSTEM_PROMPT = """Ты — доброжелательный собеседник для пожилого человека.
 Говори по-русски, тепло и простыми словами. Отвечай коротко, без сложных терминов,
 и задавай один естественный открытый вопрос, когда это уместно.
 Не осуждай и не читай нотации. Если человек сообщает об угрозе жизни, тяжёлой
 абстиненции, суицидальных мыслях или резком ухудшении здоровья, спокойно посоветуй
-обратиться к близкому человеку или вызвать скорую помощь. Не изображай врача."""
+обратиться к близкому человеку или вызвать скорую помощь. Не изображай врача.
+Человек находится в Самаре: учитывай это, говоря о времени, погоде и местной жизни,
+и не выдумывай значения погоды — если знаешь точную температуру из данных, называй её."""
 DEFAULT_DAILY_THOUGHT = "«Хороший разговор — это тоже прогулка»"
 UNIVERSAL_CHARACTER_SAFETY = """## Общая безопасность
 - Не поощряй алкоголь, наркотики, насилие или самоповреждение.
@@ -141,8 +162,8 @@ UNIVERSAL_CHARACTER_SAFETY = """## Общая безопасность
 CREATOR_FALLBACK_PROMPT = """Ты — помощник в общем диалоге с пожилым человеком.
 У тебя две роли, и ты сам выбираешь роль по сообщению собеседника: тёплый
 собеседник, если человек хочет просто поговорить, и создатель собеседников,
-если человек описывает, с кем хочет поговорить. Ты не притворяешься персонажем,
-которого создаёшь.
+если человек хочет, чтобы ты создал нового ИИ-собеседника. Ты не притворяешься
+персонажем, которого создаёшь.
 
 Всегда отвечай ровно одним JSON-объектом без Markdown-обёртки:
 - обычный разговор: {"status": "chatter", "user_message": "<твой тёплый ответ>"}
@@ -150,6 +171,13 @@ CREATOR_FALLBACK_PROMPT = """Ты — помощник в общем диало�
 - нужно уточнение: {"status": "clarification_required", "user_message": "<один-два коротких вопроса>"}
 - создать нельзя: {"status": "rejected", "user_message": "<мягкий отказ и безопасная альтернатива>"}
 - человека не удалось найти: {"status": "not_found", "user_message": "<попроси уточнить имя или рассказать, чем он известен>"}
+
+Главное правило выбора роли: собеседника создают только «с кем поговорить»,
+а не «о чём поговорить». Вопрос о вещи или предмете (микросхема, микрофон,
+погода, ремонт) — это обычный разговор (chatter), даже если предмет
+технический или незнакомый тебе. Не выдумывай собеседника-«специалиста» из
+темы вопроса. Обобщённые образы вроде «старого рыбака» создаёшь, только если
+человек просит именно собеседника в таком образе.
 
 Можно создавать: публичных исторических личностей и умерших деятелей культуры,
 вымышленных персонажей, обобщённые образы (старый рыбак, сельский учитель,
@@ -176,6 +204,13 @@ CREATOR_SWITCHED_NOTE = (
     "Собеседник сменился на «{name}». Наш прежний разговор сохранён — "
     "можно вернуться в любой момент."
 )
+
+SUMMARIZE_FALLBACK_PROMPT = """Ты ведёшь краткую сводку давней части разговора между человеком и его собеседником.
+Тебе дают предыдущую сводку (если она была) и новую часть диалога. Обнови сводку так,
+чтобы она отражала всё важное: темы и события, факты о человеке (имя, семья, здоровье,
+настроение, планы), о чём он просил и что решил.
+Пиши по-русски, от третьего лица, нейтрально и тепло, не длиннее 150 слов.
+В ответе — только текст сводки, без заголовков, приветствий и пояснений."""
 
 _PROMPT_FILE_CACHE: dict[str, str] = {}
 
@@ -286,6 +321,19 @@ class BookmarksState(BaseModel):
     bookmarks: list[Bookmark]
     active_bookmark: str = "default"
     last_created_at: datetime | None = None
+    # Момент нажатия «Добавить нового»: включает режим создания на
+    # CREATOR_SESSION_TIMEOUT_SECONDS. None — режим создания выключен.
+    creator_started_at: datetime | None = None
+
+
+class DialogSummary(BaseModel):
+    text: str
+    message_count: int = 0
+    updated_at: datetime
+
+
+class SummariesState(BaseModel):
+    summaries: dict[str, DialogSummary] = Field(default_factory=dict)
 
 
 class BookmarksResponse(BaseModel):
@@ -336,6 +384,12 @@ class SessionStore:
     def _path_for(self, code: str) -> Path:
         return self.directory / code / "dialog.json"
 
+    def _actor_path_for(self, code: str, bookmark_id: str) -> Path:
+        return self.directory / code / f"dialog_{bookmark_id}.json"
+
+    def _summaries_path_for(self, code: str) -> Path:
+        return self.directory / code / "summaries.json"
+
     def _legacy_path_for(self, code: str) -> Path:
         return self.directory / f"{code}.json"
 
@@ -384,6 +438,108 @@ class SessionStore:
                 status_code=500,
                 detail="Не удалось сохранить историю разговора.",
             ) from error
+
+    def load_actor_history(self, code: str, bookmark_id: str) -> list[DialogMessage]:
+        """История конкретного собеседника; пустой список, если её ещё нет."""
+        if bookmark_id == DEFAULT_BOOKMARK_ID:
+            return self.load(code)
+        path = self._actor_path_for(code, bookmark_id)
+        if not path.exists():
+            return []
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return [DialogMessage.model_validate(item) for item in payload["messages"]]
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            logger.exception(
+                "Could not read history %s for %s: %s", bookmark_id, code, error
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Не удалось прочитать историю этого разговора.",
+            ) from error
+
+    def save_actor_history(
+        self,
+        code: str,
+        bookmark_id: str,
+        messages: list[DialogMessage],
+    ) -> None:
+        if bookmark_id == DEFAULT_BOOKMARK_ID:
+            self.save(code, messages)
+            return
+        path = self._actor_path_for(code, bookmark_id)
+        temporary_path = path.with_suffix(".json.tmp")
+        payload = {
+            "code": code,
+            "bookmark_id": bookmark_id,
+            "updated_at": datetime.now(UTC).isoformat(),
+            "messages": [message.model_dump(mode="json") for message in messages],
+        }
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary_path.replace(path)
+        except OSError as error:
+            logger.exception(
+                "Could not save history %s for %s: %s", bookmark_id, code, error
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Не удалось сохранить историю разговора.",
+            ) from error
+
+    def delete_actor_history(self, code: str, bookmark_id: str) -> None:
+        if bookmark_id == DEFAULT_BOOKMARK_ID:
+            return
+        path = self._actor_path_for(code, bookmark_id)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            logger.exception(
+                "Could not delete history %s for %s: %s", bookmark_id, code, error
+            )
+
+    def load_summaries(self, code: str) -> SummariesState:
+        path = self._summaries_path_for(code)
+        if not path.exists():
+            return SummariesState()
+
+        try:
+            return SummariesState.model_validate(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except (OSError, TypeError, ValueError) as error:
+            logger.exception("Could not read summaries for %s: %s", code, error)
+            return SummariesState()
+
+    def save_summaries(self, code: str, state: SummariesState) -> None:
+        path = self._summaries_path_for(code)
+        temporary_path = path.with_suffix(".json.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(
+                    state.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            temporary_path.replace(path)
+        except OSError as error:
+            logger.exception("Could not save summaries for %s: %s", code, error)
+
+    def delete_actor_summary(self, code: str, bookmark_id: str) -> None:
+        state = self.load_summaries(code)
+        if bookmark_id not in state.summaries:
+            return
+        del state.summaries[bookmark_id]
+        self.save_summaries(code, state)
 
     def load_bookmarks(self, code: str) -> BookmarksState:
         path = self._bookmarks_path_for(code)
@@ -567,6 +723,21 @@ class OpenAIClient:
         return reply.strip()
 
 
+    async def complete_raw(
+        self,
+        request: list[dict[str, str]],
+    ) -> dict[str, str]:
+        """Плоское дописывание (без инструментов); возвращает content/role."""
+        if not settings.openai_api_key:
+            raise MissingOpenAIKeyError
+        message = await self.chat(request)
+        content = message.get("content")
+        return {
+            "role": str(message.get("role") or "assistant"),
+            "content": content if isinstance(content, str) else "",
+        }
+
+
 class YandexSearchClient:
     async def search(self, query: str) -> str:
         if (
@@ -620,6 +791,15 @@ class YandexSearchClient:
                 status_code=502,
                 detail="Поиск не вернул справочную информацию.",
             )
+        try:
+            # API v2 отдаёт результат (XML/HTML) в Base64 — см. официальную
+            # инструкцию «Декодируйте результат из формата Base64».
+            raw_data = base64.b64decode(raw_data).decode("utf-8", errors="replace")
+        except (ValueError, TypeError) as error:
+            raise HTTPException(
+                status_code=502,
+                detail="Не удалось разобрать результаты поиска.",
+            ) from error
         return extract_search_context(raw_data)
 
 
@@ -701,15 +881,16 @@ class WeatherClient:
 
 
 class HoroscopeClient:
-    """Сводка через Яндекс-поиск + обработка LLM (промпт из data/prompts)."""
+    """Прогноз на день: LLM, а при настроенном поиске — со свежей сводкой."""
 
     async def fetch_horoscope(self) -> str:
-        raw_data = await yandex_search_client.search(HOROSCOPE_SEARCH_QUERY)
-        summary = clean_markup(raw_data)[:4000]
-        prompt = load_prompt_file("horoscope.md")
-
-        if not prompt:
-            return summary[:400] or DEFAULT_DAILY_THOUGHT
+        search_context = await self._search_summary()
+        prompt = (
+            load_prompt_file("horoscope.md")
+            if search_context
+            else HOROSCOPE_WITHOUT_SEARCH_PROMPT
+        )
+        content = search_context or "Напиши добрый прогноз на день для пожилого человека."
 
         try:
             return await openai_client.complete(
@@ -717,17 +898,31 @@ class HoroscopeClient:
                     DialogMessage(
                         id="horoscope-request",
                         role="user",
-                        content=summary,
+                        content=content,
                         created_at=datetime.now(UTC),
                     )
                 ],
-                system_prompt=prompt,
+                system_prompt=prompt or HOROSCOPE_WITHOUT_SEARCH_PROMPT,
             )
         except MissingOpenAIKeyError:
             logger.warning(
-                "Horoscope: OPENAI_API_KEY не задан, возвращаю сырую сводку."
+                "Horoscope: OPENAI_API_KEY не задан, возвращаю запасной текст."
             )
-            return summary[:400] or DEFAULT_DAILY_THOUGHT
+            return DEFAULT_DAILY_THOUGHT
+
+    async def _search_summary(self) -> str:
+        """Свежая сводка из поиска; None, если поиск не настроен или упал."""
+        try:
+            raw_data = await yandex_search_client.search(HOROSCOPE_SEARCH_QUERY)
+        except MissingYandexSearchConfigError:
+            return ""
+        except HTTPException as error:
+            logger.warning(
+                "Horoscope: поиск не удался (%s), использую LLM без сводки.",
+                error.detail,
+            )
+            return ""
+        return clean_markup(raw_data)[:4000]
 
 
 def parse_json_object(raw_text: str) -> dict[str, object]:
@@ -771,12 +966,31 @@ def active_prompt(code: str, state: BookmarksState) -> str:
 
 
 def creator_mode_active(state: BookmarksState) -> bool:
-    """Режим агента-создателя включён, пока активен встроенный собеседник."""
-    bookmark = next(
-        (item for item in state.bookmarks if item.id == state.active_bookmark),
-        None,
-    )
-    return bookmark is None or bookmark.id == DEFAULT_BOOKMARK_ID or not bookmark.prompt_file
+    """Режим создания собеседника: явная сессия после «Добавить нового».
+
+    Включается только нажатием кнопки «Добавить нового» (см. start_creator_mode)
+    и гаснет сам через CREATOR_SESSION_TIMEOUT_SECONDS.
+    """
+    if state.creator_started_at is None:
+        return False
+    elapsed = (datetime.now(UTC) - state.creator_started_at).total_seconds()
+    return 0 <= elapsed < CREATOR_SESSION_TIMEOUT_SECONDS
+
+
+def start_creator_mode(state: BookmarksState, code: str) -> BookmarksState:
+    """Включает режим создания собеседника и запоминает момент старта."""
+    next_state = state.model_copy(update={"creator_started_at": datetime.now(UTC)})
+    store.save_bookmarks(code, next_state)
+    return next_state
+
+
+def exit_creator_mode(state: BookmarksState, code: str) -> BookmarksState:
+    """Гасит режим создания собеседника (после создания или по таймауту)."""
+    if state.creator_started_at is None:
+        return state
+    next_state = state.model_copy(update={"creator_started_at": None})
+    store.save_bookmarks(code, next_state)
+    return next_state
 
 
 def bookmarks_response(
@@ -916,17 +1130,104 @@ weather_client = WeatherClient()
 horoscope_client = HoroscopeClient()
 
 
+def trim_window(messages: list[DialogMessage]) -> list[DialogMessage]:
+    """Последние MAX_HISTORY_MESSAGES сообщений — то, что реально видит модель."""
+    if len(messages) <= MAX_HISTORY_MESSAGES:
+        return list(messages)
+    return messages[-MAX_HISTORY_MESSAGES:]
+
+
+def _summary_entry_text(entry: DialogSummary) -> str:
+    updated = entry.updated_at.astimezone(UTC).strftime("%d.%m.%Y")
+    return f"Краткое содержание более ранней части разговора (по {updated}):\n{entry.text.strip()}"
+
+
+def build_system_prompt(system_prompt: str, summary: DialogSummary | None) -> str:
+    if summary is None or not summary.text.strip():
+        return system_prompt
+    return f"{system_prompt}\n\n{_summary_entry_text(summary)}"
+
+
+def summarize_chunk_text(chunk: list[DialogMessage]) -> str:
+    lines = [
+        f"[{message.created_at.astimezone(UTC).strftime('%d.%m.%Y %H:%M')}] "
+        f"{message.role}: {message.content.strip()}"
+        for message in chunk
+    ]
+    return "\n".join(lines)
+
+
+def summarize_request_text(
+    chunk: list[DialogMessage],
+    previous: DialogSummary | None,
+) -> str:
+    headline = f"Предыдущая сводка:\n{previous.text.strip()}" if previous else None
+    conversation = summarize_chunk_text(chunk)
+    return "\n\n".join(part for part in (headline, conversation) if part)
+
+
 def to_llm_messages(
     messages: list[DialogMessage],
     system_prompt: str,
+    summary: DialogSummary | None = None,
 ) -> list[dict[str, str]]:
     return [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": build_system_prompt(system_prompt, summary)},
         *[
             {"role": message.role, "content": message.content}
-            for message in messages
+            for message in trim_window(messages)
         ],
     ]
+
+
+async def summarize_turn_after_save(
+    code: str,
+    bookmark_id: str,
+    messages: list[DialogMessage],
+) -> None:
+    """Фоновая дозапись сводки: сжимаем самый старый «хвост» истории.
+
+    Вызывается после сохранения ответа. Никогда не ломает основной диалог:
+    любая ошибка только логируется.
+
+    Первая сводка — на SUMMARY_THRESHOLD_MESSAGES сообщениях, обновление —
+    раз в SUMMARY_STEP_MESSAGES новых сообщений после свёрнутого блока.
+    """
+    if not settings.openai_api_key:
+        return
+    if len(messages) < SUMMARY_THRESHOLD_MESSAGES:
+        return
+
+    previous = store.load_summaries(code).summaries.get(bookmark_id)
+    already_summarized = previous.message_count if previous else 0
+    new_count = len(messages) - already_summarized
+    if new_count < SUMMARY_STEP_MESSAGES:
+        return
+
+    chunk = messages[:SUMMARY_CHUNK_LIMIT]
+    prompt = load_prompt_file("summarize.md") or SUMMARIZE_FALLBACK_PROMPT
+    request: list[dict[str, str]] = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": summarize_request_text(chunk, previous)},
+    ]
+    try:
+        payload = await openai_client.complete_raw(request)
+    except Exception as error:  # noqa: BLE001 - сводка не должна ронять чат
+        logger.warning("Could not update summary for %s/%s: %s", code, bookmark_id, error)
+        return
+
+    summary_text = str(payload.get("content") or "").strip()
+    if not summary_text:
+        logger.warning("Empty summary for %s/%s, keeping previous", code, bookmark_id)
+        return
+
+    summaries = store.load_summaries(code)
+    summaries.summaries[bookmark_id] = DialogSummary(
+        text=summary_text,
+        message_count=len(chunk),
+        updated_at=datetime.now(UTC),
+    )
+    store.save_summaries(code, summaries)
 
 
 def extract_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
@@ -962,8 +1263,9 @@ async def execute_search_tool(call: dict[str, object]) -> str:
 async def chat_reply(
     context: list[DialogMessage],
     system_prompt: str,
+    summary: DialogSummary | None = None,
 ) -> str:
-    request_messages = to_llm_messages(context, system_prompt)
+    request_messages = to_llm_messages(context, system_prompt, summary)
 
     message: dict[str, object] = {}
     for _ in range(MAX_SEARCH_ROUNDS):
@@ -1075,8 +1377,9 @@ def creator_system_prompt(state: BookmarksState) -> str:
 async def creator_reply(
     context: list[DialogMessage],
     system_prompt: str,
+    summary: DialogSummary | None = None,
 ) -> CreatorOutcome:
-    request_messages = to_llm_messages(context, system_prompt)
+    request_messages = to_llm_messages(context, system_prompt, summary)
 
     message: dict[str, object] = {}
     for _ in range(MAX_SEARCH_ROUNDS):
@@ -1113,12 +1416,6 @@ def _persist_created_bookmark(
     outcome: CreatorOutcome,
 ) -> Bookmark:
     """Сохраняет промпт нового собеседника в файл и добавляет его в список."""
-    if len(state.bookmarks) >= MAX_BOOKMARKS:
-        raise HTTPException(
-            status_code=400,
-            detail="Можно создать не больше десяти собеседников.",
-        )
-
     now = datetime.now(UTC)
     if state.last_created_at:
         seconds_since_creation = (
@@ -1174,14 +1471,20 @@ async def handle_creator_turn(
     normalized_code: str,
     context: list[DialogMessage],
     state: BookmarksState,
+    summary: DialogSummary | None = None,
 ) -> tuple[str, Bookmark | None]:
     """Обрабатывает сообщение в режиме агента-создателя."""
-    outcome = await creator_reply(context, creator_system_prompt(state))
+    outcome = await creator_reply(context, creator_system_prompt(state), summary)
 
     if outcome.status != "created":
         return outcome.user_message, None
 
     bookmark = _persist_created_bookmark(normalized_code, state, outcome)
+    # Персонаж готов: гасим режим создания и сразу переключаемся на него,
+    # чтобы продолжить разговор уже новым собеседником.
+    exit_creator_mode(state, normalized_code)
+    state.active_bookmark = bookmark.id
+    store.save_bookmarks(normalized_code, state)
     return (
         f"{CREATOR_SAVED_NOTE.format(name=bookmark.name)} {outcome.user_message}",
         bookmark,
@@ -1306,7 +1609,7 @@ async def get_dialog(
 ) -> DialogResponse:
     normalized_code = normalize_code(code)
     async with store.lock_for(normalized_code):
-        messages = store.load(normalized_code)
+        messages = store.load_actor_history(normalized_code, DEFAULT_BOOKMARK_ID)
     return response_for(normalized_code, messages)
 
 
@@ -1347,12 +1650,6 @@ async def create_bookmark(
 
     async with store.lock_for(normalized_code):
         state = store.load_bookmarks(normalized_code)
-        if len(state.bookmarks) >= MAX_BOOKMARKS:
-            raise HTTPException(
-                status_code=400,
-                detail="Можно создать не больше десяти собеседников.",
-            )
-
         now = datetime.now(UTC)
         if state.last_created_at:
             seconds_since_creation = (
@@ -1395,6 +1692,21 @@ async def create_bookmark(
     )
 
 
+@app.post(
+    "/api/bookmarks/{code}/creator",
+    response_model=BookmarksResponse,
+)
+async def start_creator(
+    code: str = PathParam(...),
+) -> BookmarksResponse:
+    """Включает режим создания собеседника на CREATOR_SESSION_TIMEOUT_SECONDS."""
+    normalized_code = normalize_code(code)
+    async with store.lock_for(normalized_code):
+        state = store.load_bookmarks(normalized_code)
+        state = start_creator_mode(state, normalized_code)
+    return bookmarks_response(state, DEFAULT_DAILY_THOUGHT)
+
+
 @app.put(
     "/api/bookmarks/{code}/{bookmark_id}",
     response_model=ActivateBookmarkResponse,
@@ -1416,9 +1728,11 @@ async def activate_bookmark(
                 detail="Такого собеседника нет в этом разговоре.",
             )
 
+        # Выбор любого собеседника — выход из режима создания.
+        state = exit_creator_mode(state, normalized_code)
         next_state = state.model_copy(update={"active_bookmark": target.id})
         thought = await generate_character_thought(normalized_code, next_state)
-        messages = store.load(normalized_code)
+        messages = store.load_actor_history(normalized_code, target.id)
         if state.active_bookmark != target.id and target.id != DEFAULT_BOOKMARK_ID:
             messages.append(
                 DialogMessage(
@@ -1428,7 +1742,7 @@ async def activate_bookmark(
                     created_at=datetime.now(UTC),
                 )
             )
-            store.save(normalized_code, messages)
+            store.save_actor_history(normalized_code, target.id, messages)
         store.save_bookmarks(normalized_code, next_state)
 
     return ActivateBookmarkResponse(
@@ -1474,6 +1788,8 @@ async def delete_bookmark(
         store.save_bookmarks(normalized_code, state)
         if target.prompt_file:
             store.delete_prompt(normalized_code, target.prompt_file)
+        store.delete_actor_history(normalized_code, target.id)
+        store.delete_actor_summary(normalized_code, target.id)
 
     return DeleteBookmarkResponse(
         **bookmarks_response(state, DEFAULT_DAILY_THOUGHT).model_dump(),
@@ -1498,7 +1814,26 @@ async def send_message(
                 detail="Сообщение не должно быть пустым.",
             )
         bookmark_state = store.load_bookmarks(normalized_code)
-        existing_messages = store.load(normalized_code)
+        is_creator_mode = creator_mode_active(bookmark_state)
+        active_bookmark = next(
+            (
+                bookmark
+                for bookmark in bookmark_state.bookmarks
+                if bookmark.id == bookmark_state.active_bookmark
+            ),
+            None,
+        )
+        # Режим создания живёт в общем диалоге (default). В обычном режиме
+        # у каждого собеседника своя история; default без активной сессии
+        # создания — обычный разговор со встроенным собеседником.
+        if is_creator_mode:
+            bookmark_id = DEFAULT_BOOKMARK_ID
+        elif active_bookmark is not None and active_bookmark.id != DEFAULT_BOOKMARK_ID:
+            bookmark_id = active_bookmark.id
+        else:
+            bookmark_id = DEFAULT_BOOKMARK_ID
+        # У каждого собеседника своя история; в режиме создания работает агент-создатель.
+        existing_messages = store.load_actor_history(normalized_code, bookmark_id)
         user_message = DialogMessage(
             id=f"user-{datetime.now(UTC).timestamp()}",
             role="user",
@@ -1508,19 +1843,22 @@ async def send_message(
         context = [*existing_messages, user_message]
 
         created_bookmark: Bookmark | None = None
+        actor_summary = store.load_summaries(normalized_code).summaries.get(bookmark_id)
         try:
-            if creator_mode_active(bookmark_state):
+            if is_creator_mode:
                 # Общий диалог ведёт агент-создатель: он болтает, уточняет
                 # и создаёт собеседников. Старая история при этом сохраняется.
                 reply, created_bookmark = await handle_creator_turn(
                     normalized_code,
                     context,
                     bookmark_state,
+                    actor_summary,
                 )
             else:
                 reply = await chat_reply(
                     context,
                     active_prompt(normalized_code, bookmark_state),
+                    actor_summary,
                 )
         except MissingOpenAIKeyError as error:
             raise HTTPException(
@@ -1547,7 +1885,12 @@ async def send_message(
                     created_at=datetime.now(UTC),
                 )
             )
-        store.save(normalized_code, updated_messages)
+        store.save_actor_history(normalized_code, bookmark_id, updated_messages)
+
+    # Сжатие давней истории — фоном, вне блокировки: живой диалог не ждёт LLM.
+    asyncio.create_task(
+        summarize_turn_after_save(normalized_code, bookmark_id, updated_messages)
+    )
 
     return SendMessageResponse(
         code=normalized_code,
