@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import html
 import json
 import logging
@@ -38,16 +39,29 @@ DEFAULT_BOOKMARK_ID = "default"
 DEFAULT_BOOKMARK_NAME = "Просто спросить"
 DEFAULT_BOOKMARK_ICON = "🌿"
 MAX_HISTORY_MESSAGES = 60
-# Сжатие давней истории: первая сводка создаётся, когда история собеседника
-# достигает SUMMARY_THRESHOLD_MESSAGES сообщений; дальше сводка обновляется
-# раз в SUMMARY_STEP_MESSAGES новых сообщений. Сводка хранится в summaries.json
-# и подставляется в system prompt, саму историю она не укорачивает.
+# Сжатие давней истории: сводка диалога для LLM хранится в summaries.json.
+# Пока истории меньше SUMMARY_THRESHOLD_MESSAGES сообщений, модель видит её
+# целиком; дальше каждые SUMMARY_STEP_MESSAGES новых сообщений старый хвост
+# сворачивается в сводку. Пользователь видит полную историю, LLM — сжатую
+# копию (dialog_llm.json) без служебных сообщений и старых результатов поиска.
 SUMMARY_THRESHOLD_MESSAGES = 20
-SUMMARY_STEP_MESSAGES = 20
+SUMMARY_STEP_MESSAGES = 10
 SUMMARY_CHUNK_LIMIT = 120
-SUMMARY_MESSAGE_SNIPPET_LIMIT = 1200
 MAX_SEARCH_ROUNDS = 2
 MAX_SEARCH_SNIPPETS = 5
+# Объём «сырого» результата поиска, отдаваемого в диалог модели (A): после
+# первого раунда модель читает его целиком, к другим сообщениям он не липнет.
+MAX_SEARCH_CONTEXT_CHARS = 8000
+# Сколько оставлять в tool-результате при очистке истории (C): модель уже
+# сделала выводы из поиска — в сжатой LLM-истории достаточно короткой справки.
+SEARCH_TOOL_RESULT_KEEP_CHARS = 300
+# Сводка дня (B): гороскоп ищется и генерируется раз в день (TTL 12 часов от
+# момента генерации) и кэшируется, чтобы не тратить токены на каждой загрузке
+# страницы. Отдельный кэш поиска нужен, потому что при неуспешной генерации
+# или выключенном поиске сам результат поиска выбрасывать нельзя.
+HOROSCOPE_CACHE_TTL_SECONDS = 12 * 60 * 60
+# Мысль персонажа (D): кэш на 12 минут на пару (код, собеседник, промпт).
+THOUGHT_CACHE_TTL_SECONDS = 12 * 60
 
 CHAT_TOOLS: list[dict[str, object]] = [
     {
@@ -55,9 +69,9 @@ CHAT_TOOLS: list[dict[str, object]] = [
         "function": {
             "name": "search",
             "description": (
-                "Поиск в интернете. Вызывай, когда собеседник спрашивает о фактах, "
-                "новостях, погоде, цене, расписании, биографии или другом, что могло "
-                "измениться или о чём ты не знаешь наверняка."
+                "Поиск в интернете: свежие факты, цены, расписания, события, "
+                "биографии и всё, о чём у тебя нет надёжных знаний. Запрос "
+                "формулируй кратко и по делу, чтобы поиск нашёл именно нужное."
             ),
             "parameters": {
                 "type": "object",
@@ -150,7 +164,20 @@ DEFAULT_SYSTEM_PROMPT = """Ты — доброжелательный собес�
 абстиненции, суицидальных мыслях или резком ухудшении здоровья, спокойно посоветуй
 обратиться к близкому человеку или вызвать скорую помощь. Не изображай врача.
 Человек находится в Самаре: учитывай это, говоря о времени, погоде и местной жизни,
-и не выдумывай значения погоды — если знаешь точную температуру из данных, называй её."""
+и не выдумывай значения погоды — если знаешь точную температуру из данных, называй её.
+
+Ты один из готовых собеседников в этом приложении, и ты не создаёшь новых
+собеседников. Не изображай по просьбе других персонажей и не притворяйся
+конкретным человеком — даже если тебя об этом просят.
+
+Если человек просит создать собеседника или персонажа («создай кота Матроскина»,
+«хочу говорить с Есениным, сделай так»), не описывай этого персонажа, не придумывай
+его внешность, биографию, реплики или код и не расспрашивай о нём. Ответь коротко:
+создать нового собеседника можно кнопкой «Добавить нового» в списке собеседников
+справа — приложение само его создаст, а потом с ним можно будет поговорить отдельно.
+
+При этом обсуждать Есенина, любого поэта, близких людей и любые темы можно —
+просто рассказывай сам, оставаясь собой."""
 DEFAULT_DAILY_THOUGHT = "«Хороший разговор — это тоже прогулка»"
 UNIVERSAL_CHARACTER_SAFETY = """## Общая безопасность
 - Не поощряй алкоголь, наркотики, насилие или самоповреждение.
@@ -227,6 +254,41 @@ def load_prompt_file(filename: str) -> str | None:
         content = None
     _PROMPT_FILE_CACHE[filename] = content or ""
     return content
+
+
+def cache_read(cache_path: Path, ttl_seconds: int) -> object | None:
+    """Читает JSON-кэш; None, если файла нет, он битый или устарел."""
+    try:
+        if not cache_path.is_file():
+            return None
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        logger.warning("Could not read cache %s: %s", cache_path, error)
+        return None
+    saved_at = float(payload.get("saved_at", 0) or 0)
+    if time.time() - saved_at > ttl_seconds:
+        return None
+    return payload.get("value")
+
+
+def cache_write(cache_path: Path, value: object) -> None:
+    """Атомарно пишет JSON-кэш; ошибка записи только логируется."""
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"saved_at": time.time(), "value": value}
+        temporary_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        temporary_path.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        temporary_path.replace(cache_path)
+    except OSError as error:
+        logger.warning("Could not write cache %s: %s", cache_path, error)
+
+
+def entry_fingerprint(message: DialogMessage) -> str:
+    """Отпечаток записи истории для мета-файла llm-сессии."""
+    raw = f"{message.role}|{message.created_at.isoformat()}|{message.content}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
 class Settings:
@@ -368,6 +430,9 @@ class CreatorOutcome(NamedTuple):
     name: str = ""
     icon: str = ""
     prompt_markdown: str = ""
+    # True — обычный разговор, ушедший от темы создания: режим создания можно
+    # погасить после ответа.
+    off_topic: bool = False
 
 
 class SessionStore:
@@ -540,6 +605,69 @@ class SessionStore:
             return
         del state.summaries[bookmark_id]
         self.save_summaries(code, state)
+
+    # ------------------------------------------------------------------
+    # Отдельная llm-сессия (C): то, что реально уходит в модель, хранится
+    # в dialog_llm.json рядом с полной историей dialog.json. В llm-копии
+    # нет служебных system-сообщений, старые результаты поиска сжаты до
+    # короткой справки, а давний хвост — до одной строки-заглушки: его
+    # содержание уже в сводке (summaries.json).
+    # ------------------------------------------------------------------
+
+    def _llm_path_for(self, code: str, bookmark_id: str) -> Path:
+        if bookmark_id == DEFAULT_BOOKMARK_ID:
+            return self.directory / code / "dialog_llm.json"
+        return self.directory / code / f"dialog_llm_{bookmark_id}.json"
+
+    def load_llm_history(self, code: str, bookmark_id: str) -> list[DialogMessage]:
+        path = self._llm_path_for(code, bookmark_id)
+        if not path.exists():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return [DialogMessage.model_validate(item) for item in payload["messages"]]
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            logger.exception(
+                "Could not read llm history %s for %s: %s", bookmark_id, code, error
+            )
+            return []
+
+    def save_llm_history(
+        self,
+        code: str,
+        bookmark_id: str,
+        messages: list[DialogMessage],
+    ) -> None:
+        path = self._llm_path_for(code, bookmark_id)
+        temporary_path = path.with_suffix(".json.tmp")
+        payload = {
+            "code": code,
+            "bookmark_id": bookmark_id,
+            "updated_at": datetime.now(UTC).isoformat(),
+            "messages": [message.model_dump(mode="json") for message in messages],
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary_path.replace(path)
+        except OSError as error:
+            logger.exception(
+                "Could not save llm history %s for %s: %s", bookmark_id, code, error
+            )
+
+    def delete_llm_history(self, code: str, bookmark_id: str) -> None:
+        if bookmark_id == DEFAULT_BOOKMARK_ID:
+            return
+        path = self._llm_path_for(code, bookmark_id)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            logger.exception(
+                "Could not delete llm history %s for %s: %s", bookmark_id, code, error
+            )
 
     def load_bookmarks(self, code: str) -> BookmarksState:
         path = self._bookmarks_path_for(code)
@@ -828,8 +956,8 @@ def extract_search_context(raw_data: str) -> str:
             entries.append(" — ".join(parts))
 
     if entries:
-        return "\n".join(f"- {entry}" for entry in entries)[:12000]
-    return clean_markup(raw_data)[:12000]
+        return "\n".join(f"- {entry}" for entry in entries)[:MAX_SEARCH_CONTEXT_CHARS]
+    return clean_markup(raw_data)[:MAX_SEARCH_CONTEXT_CHARS]
 
 
 class WeatherClient:
@@ -881,9 +1009,17 @@ class WeatherClient:
 
 
 class HoroscopeClient:
-    """Прогноз на день: LLM, а при настроенном поиске — со свежей сводкой."""
+    """Прогноз на день: LLM, а при настроенном поиске — со свежей сводкой.
+
+    (B) Результат кэшируется на HOROSCOPE_CACHE_TTL_SECONDS (~полдня): без
+    кэша каждая загрузка страницы давала и LLM-запрос, и свежий поиск.
+    """
 
     async def fetch_horoscope(self) -> str:
+        cached = cache_read(self._cache_path(), HOROSCOPE_CACHE_TTL_SECONDS)
+        if isinstance(cached, str) and cached.strip():
+            return cached
+
         search_context = await self._search_summary()
         prompt = (
             load_prompt_file("horoscope.md")
@@ -893,7 +1029,7 @@ class HoroscopeClient:
         content = search_context or "Напиши добрый прогноз на день для пожилого человека."
 
         try:
-            return await openai_client.complete(
+            horoscope = await openai_client.complete(
                 [
                     DialogMessage(
                         id="horoscope-request",
@@ -909,6 +1045,11 @@ class HoroscopeClient:
                 "Horoscope: OPENAI_API_KEY не задан, возвращаю запасной текст."
             )
             return DEFAULT_DAILY_THOUGHT
+        cache_write(self._cache_path(), horoscope)
+        return horoscope
+
+    def _cache_path(self) -> Path:
+        return store.directory / ".horoscope_cache.json"
 
     async def _search_summary(self) -> str:
         """Свежая сводка из поиска; None, если поиск не настроен или упал."""
@@ -1009,8 +1150,22 @@ async def generate_character_thought(code: str, state: BookmarksState) -> str:
         return DEFAULT_DAILY_THOUGHT
 
     character_prompt = active_prompt(code, state)
+    # (D) Мысль не зависит от сообщений диалога, а /api/bookmarks дёргается
+    # при каждой загрузке страницы и после каждого создания собеседника.
+    # Кэш на THOUGHT_CACHE_TTL_SECONDS (12 минут) экономит эти запросы.
+    # Файл один — храним последнюю сгенерированную мысль.
+    cache_path = store.directory / ".thought_cache.json"
+    cache_key = hashlib.sha1(
+        f"{code}|{state.active_bookmark}|{character_prompt}".encode("utf-8")
+    ).hexdigest()[:16]
+    cached = cache_read(cache_path, THOUGHT_CACHE_TTL_SECONDS)
+    if isinstance(cached, dict) and cached.get("key") == cache_key:
+        text = str(cached.get("text", "")).strip()
+        if text:
+            return text
+
     try:
-        return await openai_client.complete(
+        thought = await openai_client.complete(
             [
                 DialogMessage(
                     id="thought-request",
@@ -1023,6 +1178,8 @@ async def generate_character_thought(code: str, state: BookmarksState) -> str:
         )
     except MissingOpenAIKeyError:
         return DEFAULT_DAILY_THOUGHT
+    cache_write(cache_path, {"key": cache_key, "text": thought})
+    return thought
 
 
 async def moderate_description(description: str) -> None:
@@ -1137,6 +1294,84 @@ def trim_window(messages: list[DialogMessage]) -> list[DialogMessage]:
     return messages[-MAX_HISTORY_MESSAGES:]
 
 
+def compress_tool_result(content: str) -> str:
+    """Короткая справка вместо полного результата поиска (C).
+
+    Полный результат нужен модели, пока она отвечает на сообщение, ради
+    которого искала. Дальше в истории достаточно краткой пометки — выводы
+    из поиска уже в ответах модели.
+    """
+    cleaned = re.sub(r"\s+", " ", content).strip()
+    if len(cleaned) <= SEARCH_TOOL_RESULT_KEEP_CHARS:
+        return cleaned
+    return cleaned[: SEARCH_TOOL_RESULT_KEEP_CHARS - 1].rstrip() + "…"
+
+
+def cleaned_llm_history(messages: list[DialogMessage]) -> list[DialogMessage]:
+    """Очищенная llm-копия истории (C). UI-историю не трогает.
+
+    Правила:
+    - role="system" — служебные заметки (создание/смена собеседника):
+      в llm-контекст не попадают;
+    - результат поиска остаётся полным, пока после него прошло меньше двух
+      «обычных» сообщений (ответ + одна реплика); дальше сжимается до
+      короткой справки.
+    """
+    cleaned: list[DialogMessage] = []
+    for index, message in enumerate(messages):
+        if message.role == "system":
+            continue
+        if message.role == "tool":
+            non_tool_after = sum(
+                1 for item in messages[index + 1 :] if item.role != "tool"
+            )
+            content = (
+                message.content
+                if non_tool_after < 2
+                else compress_tool_result(message.content)
+            )
+            cleaned.append(message.model_copy(update={"content": content}))
+            continue
+        cleaned.append(message.model_copy())
+    return cleaned
+
+
+def trimmed_llm_for_summary(
+    llm_messages: list[DialogMessage],
+    summarized_chunk: list[DialogMessage],
+) -> list[DialogMessage]:
+    """Убирает из llm-сессии сообщения, ушедшие в сводку (C).
+
+    Границу находит по отпечатку последнего сообщения свёрнутого куска:
+    содержимое давнего хвоста уже в summaries.json.
+    """
+    if not summarized_chunk:
+        return llm_messages
+    boundary = entry_fingerprint(summarized_chunk[-1])
+    for index, message in enumerate(llm_messages):
+        if message.role == "tool":
+            continue
+        if entry_fingerprint(message) == boundary:
+            return llm_messages[index + 1 :]
+    return llm_messages
+
+
+def to_llm_messages(
+    messages: list[DialogMessage],
+    system_prompt: str,
+    summary: DialogSummary | None = None,
+) -> list[dict[str, str]]:
+    # На вход приходит уже очищенная llm-копия (см. cleaned_llm_history);
+    # trim_window — последний предохранитель от аномально длинной сессии.
+    return [
+        {"role": "system", "content": build_system_prompt(system_prompt, summary)},
+        *[
+            {"role": message.role, "content": message.content}
+            for message in trim_window(messages)
+        ],
+    ]
+
+
 def _summary_entry_text(entry: DialogSummary) -> str:
     updated = entry.updated_at.astimezone(UTC).strftime("%d.%m.%Y")
     return f"Краткое содержание более ранней части разговора (по {updated}):\n{entry.text.strip()}"
@@ -1180,54 +1415,78 @@ def to_llm_messages(
     ]
 
 
-async def summarize_turn_after_save(
+async def compress_llm_session_after_save(
     code: str,
     bookmark_id: str,
-    messages: list[DialogMessage],
+    updated_messages: list[DialogMessage],
+    search_trace: list[DialogMessage],
 ) -> None:
-    """Фоновая дозапись сводки: сжимаем самый старый «хвост» истории.
+    """Фоновое сжатие llm-сессии (C). Никогда не ломает основной диалог.
 
-    Вызывается после сохранения ответа. Никогда не ломает основной диалог:
-    любая ошибка только логируется.
-
-    Первая сводка — на SUMMARY_THRESHOLD_MESSAGES сообщениях, обновление —
-    раз в SUMMARY_STEP_MESSAGES новых сообщений после свёрнутого блока.
+    Обновляет dialog_llm[_bookmark].json: трассировка поиска этого хода,
+    очистка старых результатов, срез сведённого хвоста, обновление сводки
+    раз в SUMMARY_STEP_MESSAGES новых сообщений (первая — на
+    SUMMARY_THRESHOLD_MESSAGES).
     """
-    if not settings.openai_api_key:
-        return
-    if len(messages) < SUMMARY_THRESHOLD_MESSAGES:
-        return
-
-    previous = store.load_summaries(code).summaries.get(bookmark_id)
-    already_summarized = previous.message_count if previous else 0
-    new_count = len(messages) - already_summarized
-    if new_count < SUMMARY_STEP_MESSAGES:
-        return
-
-    chunk = messages[:SUMMARY_CHUNK_LIMIT]
-    prompt = load_prompt_file("summarize.md") or SUMMARIZE_FALLBACK_PROMPT
-    request: list[dict[str, str]] = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": summarize_request_text(chunk, previous)},
-    ]
     try:
-        payload = await openai_client.complete_raw(request)
-    except Exception as error:  # noqa: BLE001 - сводка не должна ронять чат
-        logger.warning("Could not update summary for %s/%s: %s", code, bookmark_id, error)
-        return
+        llm_messages = store.load_llm_history(code, bookmark_id)
+        if not llm_messages:
+            llm_messages = cleaned_llm_history(updated_messages)
+        else:
+            known = {entry_fingerprint(message) for message in llm_messages}
+            llm_messages = [
+                *llm_messages,
+                *[
+                    message
+                    for message in updated_messages
+                    if message.role != "system"
+                    and entry_fingerprint(message) not in known
+                ],
+            ]
+        llm_messages = [*llm_messages, *search_trace]
 
-    summary_text = str(payload.get("content") or "").strip()
-    if not summary_text:
-        logger.warning("Empty summary for %s/%s, keeping previous", code, bookmark_id)
-        return
+        previous = store.load_summaries(code).summaries.get(bookmark_id)
+        if previous is not None:
+            summarized_chunk = updated_messages[: previous.message_count]
+            llm_messages = trimmed_llm_for_summary(llm_messages, summarized_chunk)
 
-    summaries = store.load_summaries(code)
-    summaries.summaries[bookmark_id] = DialogSummary(
-        text=summary_text,
-        message_count=len(chunk),
-        updated_at=datetime.now(UTC),
-    )
-    store.save_summaries(code, summaries)
+        store.save_llm_history(code, bookmark_id, llm_messages)
+
+        if not settings.openai_api_key:
+            return
+        already_summarized = previous.message_count if previous else 0
+        new_count = len(updated_messages) - already_summarized
+        if new_count < SUMMARY_STEP_MESSAGES:
+            return
+
+        chunk = updated_messages[:SUMMARY_CHUNK_LIMIT]
+        prompt = load_prompt_file("summarize.md") or SUMMARIZE_FALLBACK_PROMPT
+        request: list[dict[str, str]] = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": summarize_request_text(chunk, previous)},
+        ]
+        try:
+            payload = await openai_client.complete_raw(request)
+        except Exception as error:  # noqa: BLE001 - сводка не должна ронять чат
+            logger.warning(
+                "Could not update summary for %s/%s: %s", code, bookmark_id, error
+            )
+            return
+
+        summary_text = str(payload.get("content") or "").strip()
+        if not summary_text:
+            logger.warning("Empty summary for %s/%s, keeping previous", code, bookmark_id)
+            return
+
+        summaries = store.load_summaries(code)
+        summaries.summaries[bookmark_id] = DialogSummary(
+            text=summary_text,
+            message_count=len(chunk),
+            updated_at=datetime.now(UTC),
+        )
+        store.save_summaries(code, summaries)
+    except Exception as error:  # noqa: BLE001 - фоновая задача не должна падать
+        logger.exception("Could not compress llm session %s/%s: %s", code, bookmark_id, error)
 
 
 def extract_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
@@ -1264,8 +1523,14 @@ async def chat_reply(
     context: list[DialogMessage],
     system_prompt: str,
     summary: DialogSummary | None = None,
-) -> str:
+) -> tuple[str, list[DialogMessage]]:
+    """Отвечает на сообщение; возвращает реплику и трассировку поиска (C).
+
+    Трассировка — модельные вызовы поиска и их полные результаты за этот
+    ход: именно их пользователь не видит, а llm-сессия должна содержать.
+    """
     request_messages = to_llm_messages(context, system_prompt, summary)
+    search_trace: list[DialogMessage] = []
 
     message: dict[str, object] = {}
     for _ in range(MAX_SEARCH_ROUNDS):
@@ -1286,6 +1551,14 @@ async def chat_reply(
             request_messages.append(
                 {"role": "tool", "tool_call_id": call_id, "content": result}
             )
+            search_trace.append(
+                DialogMessage(
+                    id=f"tool-{call_id}",
+                    role="tool",
+                    content=result,
+                    created_at=datetime.now(UTC),
+                )
+            )
 
     reply = message.get("content")
     if not isinstance(reply, str) or not reply.strip():
@@ -1293,7 +1566,7 @@ async def chat_reply(
             status_code=502,
             detail="Собеседник вернул пустой ответ. Попробуйте ещё раз.",
         )
-    return reply.strip()
+    return reply.strip(), search_trace
 
 
 # --------------------------------------------------------------------------
@@ -1330,6 +1603,11 @@ def _creator_outcome_from_payload(
     name = str(payload.get("name", "")).strip()[:80]
     icon = str(payload.get("icon", "✨")).strip()[:4] or "✨"
     prompt_markdown = str(payload.get("prompt_markdown", "")).strip()
+    raw_off_topic = payload.get("off_topic", False)
+    if isinstance(raw_off_topic, bool):
+        off_topic = raw_off_topic
+    else:
+        off_topic = str(raw_off_topic).strip().lower() in {"true", "1", "yes", "да"}
 
     if status == "created" and (not name or not prompt_markdown):
         # Модель не передала обязательные поля — считаем ответ обычной репликой.
@@ -1350,6 +1628,7 @@ def _creator_outcome_from_payload(
         name=name,
         icon=icon,
         prompt_markdown=prompt_markdown,
+        off_topic=off_topic,
     )
 
 
@@ -1378,8 +1657,10 @@ async def creator_reply(
     context: list[DialogMessage],
     system_prompt: str,
     summary: DialogSummary | None = None,
-) -> CreatorOutcome:
+) -> tuple[CreatorOutcome, list[DialogMessage]]:
+    """Отвечает агент-создатель; возвращает исход и трассировку поиска (C)."""
     request_messages = to_llm_messages(context, system_prompt, summary)
+    search_trace: list[DialogMessage] = []
 
     message: dict[str, object] = {}
     for _ in range(MAX_SEARCH_ROUNDS):
@@ -1400,6 +1681,14 @@ async def creator_reply(
             request_messages.append(
                 {"role": "tool", "tool_call_id": call_id, "content": result}
             )
+            search_trace.append(
+                DialogMessage(
+                    id=f"tool-{call_id}",
+                    role="tool",
+                    content=result,
+                    created_at=datetime.now(UTC),
+                )
+            )
 
     raw_reply = message.get("content")
     if not isinstance(raw_reply, str) or not raw_reply.strip():
@@ -1407,7 +1696,7 @@ async def creator_reply(
             status_code=502,
             detail="Собеседник вернул пустой ответ. Попробуйте ещё раз.",
         )
-    return parse_creator_outcome(raw_reply.strip())
+    return parse_creator_outcome(raw_reply.strip()), search_trace
 
 
 def _persist_created_bookmark(
@@ -1472,12 +1761,23 @@ async def handle_creator_turn(
     context: list[DialogMessage],
     state: BookmarksState,
     summary: DialogSummary | None = None,
-) -> tuple[str, Bookmark | None]:
-    """Обрабатывает сообщение в режиме агента-создателя."""
-    outcome = await creator_reply(context, creator_system_prompt(state), summary)
+) -> tuple[str, Bookmark | None, list[DialogMessage]]:
+    """Обрабатывает сообщение в режиме агента-создателя.
+
+    Третий элемент — трассировка поиска этого хода (C): агент ищет справку
+    о персонаже, и эти tool-результаты нужны llm-сессии, хотя пользователь
+    их не видит.
+    """
+    outcome, search_trace = await creator_reply(
+        context, creator_system_prompt(state), summary
+    )
 
     if outcome.status != "created":
-        return outcome.user_message, None
+        # Обычный разговор, ушедший от темы создания: гасим режим, чтобы
+        # дальше говорил встроенный собеседник «Просто спросить».
+        if outcome.off_topic:
+            exit_creator_mode(state, normalized_code)
+        return outcome.user_message, None, search_trace
 
     bookmark = _persist_created_bookmark(normalized_code, state, outcome)
     # Персонаж готов: гасим режим создания и сразу переключаемся на него,
@@ -1488,6 +1788,7 @@ async def handle_creator_turn(
     return (
         f"{CREATOR_SAVED_NOTE.format(name=bookmark.name)} {outcome.user_message}",
         bookmark,
+        search_trace,
     )
 
 
@@ -1714,6 +2015,7 @@ async def start_creator(
 async def activate_bookmark(
     bookmark_id: str,
     code: str = PathParam(...),
+    ui_action: bool = False,
 ) -> ActivateBookmarkResponse:
     normalized_code = normalize_code(code)
     async with store.lock_for(normalized_code):
@@ -1728,8 +2030,12 @@ async def activate_bookmark(
                 detail="Такого собеседника нет в этом разговоре.",
             )
 
-        # Выбор любого собеседника — выход из режима создания.
-        state = exit_creator_mode(state, normalized_code)
+        # Клик по любому собеседнику в UI — выход из режима создания
+        # (пользователь ушёл создавать). Программное переключение без флага
+        # (кнопка «Добавить нового» переводит диалог на default, чтобы агент-
+        # создатель вёл общий диалог) режим создания не гасит — см. send_message.
+        if ui_action:
+            state = exit_creator_mode(state, normalized_code)
         next_state = state.model_copy(update={"active_bookmark": target.id})
         thought = await generate_character_thought(normalized_code, next_state)
         messages = store.load_actor_history(normalized_code, target.id)
@@ -1790,6 +2096,7 @@ async def delete_bookmark(
             store.delete_prompt(normalized_code, target.prompt_file)
         store.delete_actor_history(normalized_code, target.id)
         store.delete_actor_summary(normalized_code, target.id)
+        store.delete_llm_history(normalized_code, target.id)
 
     return DeleteBookmarkResponse(
         **bookmarks_response(state, DEFAULT_DAILY_THOUGHT).model_dump(),
@@ -1844,18 +2151,19 @@ async def send_message(
 
         created_bookmark: Bookmark | None = None
         actor_summary = store.load_summaries(normalized_code).summaries.get(bookmark_id)
+        search_trace: list[DialogMessage] = []
         try:
             if is_creator_mode:
                 # Общий диалог ведёт агент-создатель: он болтает, уточняет
                 # и создаёт собеседников. Старая история при этом сохраняется.
-                reply, created_bookmark = await handle_creator_turn(
+                reply, search_trace = await handle_creator_turn(
                     normalized_code,
                     context,
                     bookmark_state,
                     actor_summary,
                 )
             else:
-                reply = await chat_reply(
+                reply, search_trace = await chat_reply(
                     context,
                     active_prompt(normalized_code, bookmark_state),
                     actor_summary,
@@ -1887,9 +2195,11 @@ async def send_message(
             )
         store.save_actor_history(normalized_code, bookmark_id, updated_messages)
 
-    # Сжатие давней истории — фоном, вне блокировки: живой диалог не ждёт LLM.
+    # Сжатие llm-сессии — фоном, вне блокировки: живой диалог не ждёт LLM.
     asyncio.create_task(
-        summarize_turn_after_save(normalized_code, bookmark_id, updated_messages)
+        compress_llm_session_after_save(
+            normalized_code, bookmark_id, updated_messages, search_trace
+        )
     )
 
     return SendMessageResponse(

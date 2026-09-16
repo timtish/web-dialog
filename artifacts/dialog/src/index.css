@@ -315,6 +315,24 @@
   line-height: 1.55;
 }
 
+/* Переносим строки как в ответе модели, иначе список ссылок склеивается. */
+.message-bubble > div {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* Ссылки внутри сообщений должны выглядеть и вести себя как ссылки. */
+.message-bubble a {
+  color: #43684f;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.message-bubble a:hover {
+  color: #2c4a37;
+}
+
 .message-row.user .message-bubble {
   border-color: rgba(156, 103, 78, .13);
   border-radius: 18px 5px 18px 18px;

@@ -1,5 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import {
   CloudSun,
   LifeBuoy,
@@ -116,6 +115,58 @@ function formatMessageTime(value: string) {
     hour: '2-digit',
     minute: '2-digit',
   }).format(date);
+}
+
+// Ссылки в ответах собеседника (Markdown «[текст](url)» и «голые» URL)
+// делаем кликабельными; остальной текст остаётся как есть. Ссылкой станет
+// только http(s)-URL — всё остальное останется обычным текстом.
+const MESSAGE_LINK_PATTERN =
+  /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>")\]]+)/g;
+
+function renderMessageLink(label: string, url: string, key: string) {
+  return (
+    <a href={url} target="_blank" rel="noopener noreferrer" key={key}>
+      {label}
+    </a>
+  );
+}
+
+function linkifyMessageText(text: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  // Регулярное выражение создаём локально: у него изменяется lastIndex.
+  const pattern = new RegExp(MESSAGE_LINK_PATTERN.source, 'g');
+  let cursor = 0;
+  let linkIndex = 0;
+  let match = pattern.exec(text);
+
+  while (match !== null) {
+    if (match.index > cursor) {
+      nodes.push(text.slice(cursor, match.index));
+    }
+
+    const markdownUrl = match[2];
+    const bareUrl = match[3];
+    if (markdownUrl) {
+      nodes.push(renderMessageLink(match[1], markdownUrl, `link-${linkIndex}`));
+    } else if (bareUrl) {
+      // Замыкающую пунктуацию в ссылку не берём: «…вот ссылка https://…».
+      const url = bareUrl.replace(/[.,;:!?]+$/, '');
+      const trailing = bareUrl.slice(url.length);
+      nodes.push(renderMessageLink(url, url, `link-${linkIndex}`));
+      if (trailing) {
+        nodes.push(trailing);
+      }
+    }
+
+    cursor = match.index + match[0].length;
+    linkIndex += 1;
+    match = pattern.exec(text);
+  }
+
+  if (cursor < text.length) {
+    nodes.push(text.slice(cursor));
+  }
+  return nodes.length > 0 ? nodes : [text];
 }
 
 function fromApiMessages(messages: ApiMessage[]): Message[] {
@@ -446,7 +497,7 @@ function Home() {
     setIsSwitchingBookmark(bookmarkId);
     try {
       const response = await fetch(
-        `/api/bookmarks/${encodeURIComponent(code)}/${encodeURIComponent(bookmarkId)}`,
+        `/api/bookmarks/${encodeURIComponent(code)}/${encodeURIComponent(bookmarkId)}?ui_action=true`,
         { method: 'PUT' },
       );
       const payload = (await response.json()) as BookmarksPayload & {
@@ -593,7 +644,9 @@ function Home() {
                     </div>
                   )}
                   <div className="message-bubble">
-                    <div data-testid={`message-text-${message.id}`}>{message.text}</div>
+                    <div data-testid={`message-text-${message.id}`}>
+                      {linkifyMessageText(message.text)}
+                    </div>
                   </div>
                   {message.role === 'user' && (
                     <div className="message-side">
