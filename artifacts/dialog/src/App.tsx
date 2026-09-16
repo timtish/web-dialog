@@ -808,7 +808,14 @@ function Home() {
                     className={`bookmark-item ${bookmark.id === activeBookmark ? 'active' : ''}`}
                     type="button"
                     key={bookmark.id}
-                    onClick={() => void handleActivateBookmark(bookmark.id)}
+                    onClick={() =>
+                      void handleActivateBookmark(bookmark.id, {
+                        // «Просто спросить» активен и в режиме создания
+                        // (агент-создатель ведёт общий диалог): клик по нему
+                        // должен выходить из режима, а не игнорироваться.
+                        allowSame: bookmark.id === DEFAULT_BOOKMARK_ID,
+                      })
+                    }
                     disabled={Boolean(isSwitchingBookmark)}
                     aria-pressed={bookmark.id === activeBookmark}
                   >
