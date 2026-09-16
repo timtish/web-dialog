@@ -340,7 +340,9 @@ settings = Settings()
 
 class DialogMessage(BaseModel):
     id: str
-    role: Literal["user", "assistant", "system"]
+    # "tool" — результат вызова инструмента (поиска) из трассировки llm-сессии;
+    # пользователь такие сообщения не видит.
+    role: Literal["user", "assistant", "system", "tool"]
     content: str
     created_at: datetime
 

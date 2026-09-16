@@ -94,6 +94,17 @@ const CREATOR_PROMPT_ID = 'creator-prompt';
 const CREATOR_PROMPT =
   'Опиши нового собеседника, им может быть поэт, политик или кто-то из повестей известных, например: «Сергей Есенин, поэт, говори поэтично про природу».';
 
+// Читаем тело ответа без пугающих технических ошибок: если сервер вернул не
+// JSON (заглушка прокси, пустое тело), показываем «Ошибка на сервере», а не
+// SyntaxError от JSON.parse.
+async function readResponse(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
 function formatMessageTime(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
@@ -237,7 +248,7 @@ function Home() {
       setError('');
       try {
         const response = await fetch(`/api/dialog/${encodeURIComponent(code)}`);
-        const payload = (await response.json()) as
+        const payload = (await readResponse(response)) as
           | { messages?: ApiMessage[]; detail?: string }
           | undefined;
         if (!response.ok) {
@@ -275,7 +286,9 @@ function Home() {
       setBookmarkError('');
       try {
         const response = await fetch(`/api/bookmarks/${encodeURIComponent(code)}`);
-        const payload = (await response.json()) as BookmarksPayload & { detail?: string };
+        const payload = (await readResponse(response)) as BookmarksPayload & {
+          detail?: string;
+        };
         if (!response.ok) {
           throw new Error(payload.detail ?? 'Не удалось загрузить собеседников.');
         }
@@ -311,7 +324,9 @@ function Home() {
     const loadWeather = async () => {
       try {
         const response = await fetch('/api/weather');
-        const payload = (await response.json()) as Weather & { detail?: string };
+        const payload = (await readResponse(response)) as Weather & {
+          detail?: string;
+        };
         if (!response.ok) {
           return;
         }
@@ -340,7 +355,7 @@ function Home() {
     const loadGreeting = async () => {
       try {
         const response = await fetch('/api/greeting');
-        const payload = (await response.json()) as GreetingPayload;
+        const payload = (await readResponse(response)) as GreetingPayload;
         if (!response.ok) {
           return;
         }
@@ -364,7 +379,9 @@ function Home() {
     const loadHoroscope = async () => {
       try {
         const response = await fetch('/api/horoscope');
-        const payload = (await response.json()) as HoroscopePayload & { detail?: string };
+        const payload = (await readResponse(response)) as HoroscopePayload & {
+          detail?: string;
+        };
         if (!response.ok) {
           return;
         }
@@ -415,7 +432,7 @@ function Home() {
           body: JSON.stringify({ message: next.text }),
         },
       );
-      const payload = (await response.json()) as SendMessagePayload;
+      const payload = (await readResponse(response)) as SendMessagePayload;
       if (!response.ok) {
         throw new Error(payload?.detail ?? 'Собеседник пока не отвечает.');
       }
@@ -468,7 +485,9 @@ function Home() {
     setBookmarkError('');
     try {
       const response = await fetch(`/api/bookmarks/${encodeURIComponent(code)}`);
-      const payload = (await response.json()) as BookmarksPayload & { detail?: string };
+      const payload = (await readResponse(response)) as BookmarksPayload & {
+        detail?: string;
+      };
       if (!response.ok) {
         throw new Error(payload.detail ?? 'Не удалось загрузить собеседников.');
       }
@@ -505,7 +524,7 @@ function Home() {
         `/api/bookmarks/${encodeURIComponent(code)}/${encodeURIComponent(bookmarkId)}?ui_action=${uiAction}`,
         { method: 'PUT' },
       );
-      const payload = (await response.json()) as BookmarksPayload & {
+      const payload = (await readResponse(response)) as BookmarksPayload & {
         messages?: ApiMessage[];
         detail?: string;
       };
@@ -536,7 +555,9 @@ function Home() {
         `/api/bookmarks/${encodeURIComponent(code)}/creator`,
         { method: 'POST' },
       );
-      const payload = (await response.json()) as BookmarksPayload & { detail?: string };
+      const payload = (await readResponse(response)) as BookmarksPayload & {
+        detail?: string;
+      };
       if (!response.ok) {
         throw new Error(payload.detail ?? 'Не удалось включить создание собеседника.');
       }
