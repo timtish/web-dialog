@@ -236,7 +236,7 @@ function Home() {
       setIsLoadingHistory(true);
       setError('');
       try {
-        const response = await fetch(`/api/dialog/${encodeURIComponent(code)}`);
+        const response = await fetch(`/dialog/get/${encodeURIComponent(code)}`);
         const payload = (await response.json()) as
           | { messages?: ApiMessage[]; detail?: string }
           | undefined;
@@ -274,7 +274,7 @@ function Home() {
       setIsLoadingBookmarks(true);
       setBookmarkError('');
       try {
-        const response = await fetch(`/api/bookmarks/${encodeURIComponent(code)}`);
+        const response = await fetch(`/dialog/bookmarks/${encodeURIComponent(code)}`);
         const payload = (await response.json()) as BookmarksPayload & { detail?: string };
         if (!response.ok) {
           throw new Error(payload.detail ?? 'Не удалось загрузить собеседников.');
@@ -310,7 +310,7 @@ function Home() {
 
     const loadWeather = async () => {
       try {
-        const response = await fetch('/api/weather');
+        const response = await fetch('/dialog/api/weather');
         const payload = (await response.json()) as Weather & { detail?: string };
         if (!response.ok) {
           return;
@@ -339,7 +339,7 @@ function Home() {
 
     const loadGreeting = async () => {
       try {
-        const response = await fetch('/api/greeting');
+        const response = await fetch('/dialog/api/greeting');
         const payload = (await response.json()) as GreetingPayload;
         if (!response.ok) {
           return;
@@ -363,7 +363,7 @@ function Home() {
 
     const loadHoroscope = async () => {
       try {
-        const response = await fetch('/api/horoscope');
+        const response = await fetch('/dialog/api/horoscope');
         const payload = (await response.json()) as HoroscopePayload & { detail?: string };
         if (!response.ok) {
           return;
@@ -408,7 +408,7 @@ function Home() {
 
     try {
       const response = await fetch(
-        `/api/dialog/${encodeURIComponent(code)}/messages`,
+        `/dialog/messages/${encodeURIComponent(code)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -422,7 +422,7 @@ function Home() {
       setMessages(fromApiMessages(payload?.messages ?? []));
       if (payload?.created_bookmark) {
         // Новый собеседник уже в ответе API — показываем сразу, не дожидаясь
-        // медленного /api/bookmarks (тот ждёт LLM-«мысль» и запаздывает).
+        // медленного /dialog/bookmarks (тот ждёт LLM-«мысль» и запаздывает).
         const created = payload.created_bookmark;
         setBookmarks((current) =>
           current.some((bookmark) => bookmark.id === created.id)
@@ -467,7 +467,7 @@ function Home() {
     setIsRefreshingBookmarks(true);
     setBookmarkError('');
     try {
-      const response = await fetch(`/api/bookmarks/${encodeURIComponent(code)}`);
+      const response = await fetch(`/dialog/bookmarks/${encodeURIComponent(code)}`);
       const payload = (await response.json()) as BookmarksPayload & { detail?: string };
       if (!response.ok) {
         throw new Error(payload.detail ?? 'Не удалось загрузить собеседников.');
@@ -497,7 +497,7 @@ function Home() {
     setIsSwitchingBookmark(bookmarkId);
     try {
       const response = await fetch(
-        `/api/bookmarks/${encodeURIComponent(code)}/${encodeURIComponent(bookmarkId)}?ui_action=true`,
+        `/dialog/bookmarks/${encodeURIComponent(code)}/${encodeURIComponent(bookmarkId)}?ui_action=true`,
         { method: 'PUT' },
       );
       const payload = (await response.json()) as BookmarksPayload & {
@@ -528,7 +528,7 @@ function Home() {
     // ведёт агент-создатель, который болтает, уточняет и создаёт собеседников.
     const startCreator = async () => {
       const response = await fetch(
-        `/api/bookmarks/${encodeURIComponent(code)}/creator`,
+        `/dialog/bookmarks/${encodeURIComponent(code)}/creator`,
         { method: 'POST' },
       );
       const payload = (await response.json()) as BookmarksPayload & { detail?: string };
@@ -832,7 +832,7 @@ function Router() {
   return (
     <RoutedErrorBoundary>
       <Switch>
-        <Route path="/dialog/:code" component={Home} />
+        <Route path="/:code" component={Home} />
         <Route path="/" component={Home} />
         <Route component={NotFound} />
       </Switch>

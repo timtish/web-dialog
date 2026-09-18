@@ -1,6 +1,6 @@
 cd /opt/dialog
 pnpm install
-PORT=8011 BASE_PATH=/ pnpm --filter @workspace/dialog run build   # появится dist/public
+pnpm --filter @workspace/dialog-ui run build   # появится dist/public
 sudo cp systemd/dialog.service /etc/systemd/system/
 
 sudo useradd -r -s /usr/sbin/nologin dialog

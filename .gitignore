@@ -49,6 +49,6 @@ Thumbs.db
 .local/
 
 # Dialogs conversation sessions
-/data/sessions/
+/artifacts/data/sessions/
 
 __pycache__

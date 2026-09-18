@@ -103,10 +103,14 @@ PROMPTS_DIR = Path(
 )
 
 # Собранный фронтенд раздаётся тем же процессом FastAPI (один порт, один origin).
-# Перед деплоем собрать: PORT=8011 BASE_PATH=/ pnpm --filter @workspace/dialog run build
+# Перед деплоем собрать: PORT=8011 BASE_PATH=/ pnpm --filter @workspace/dialog-ui run build
 DIALOG_UI_DIST_DIR = Path(
-    os.getenv("DIALOG_UI_DIST_DIR", "dialog/dist/public")
+    os.getenv("DIALOG_UI_DIST_DIR", "dialog-ui/dist/public")
 )
+# Путь вычисляется при импорте модуля: при запуске через uvicorn CLI
+# (uvicorn main:app, в том числе с --reload) блок __main__ не выполняется,
+# и serve_spa всё равно должен знать путь к index.html.
+index_html = DIALOG_UI_DIST_DIR / "index.html"
 
 GREETING_MORNING_CUTOFF = 11
 GREETING_EVENING_CUTOFF = 17
@@ -1150,7 +1154,7 @@ async def generate_character_thought(code: str, state: BookmarksState) -> str:
         return DEFAULT_DAILY_THOUGHT
 
     character_prompt = active_prompt(code, state)
-    # (D) Мысль не зависит от сообщений диалога, а /api/bookmarks дёргается
+    # (D) Мысль не зависит от сообщений диалога, а /dialog/bookmarks дёргается
     # при каждой загрузке страницы и после каждого создания собеседника.
     # Кэш на THOUGHT_CACHE_TTL_SECONDS (12 минут) экономит эти запросы.
     # Файл один — храним последнюю сгенерированную мысль.
@@ -1834,7 +1838,7 @@ app.add_middleware(
 )
 
 
-@app.get("/api/healthz")
+@app.get("/dialog/api/healthz")
 async def healthz() -> dict[str, str | bool]:
     return {
         "status": "ok",
@@ -1867,7 +1871,7 @@ def build_greeting_text(time_of_day: str) -> str:
 
 
 @app.get(
-    "/api/greeting",
+    "/dialog/api/greeting",
     response_model=Greeting,
 )
 async def get_greeting() -> Greeting:
@@ -1877,7 +1881,7 @@ async def get_greeting() -> Greeting:
 
 
 @app.get(
-    "/api/weather",
+    "/dialog/api/weather",
     response_model=WeatherResponse,
 )
 async def get_weather() -> WeatherResponse:
@@ -1885,7 +1889,7 @@ async def get_weather() -> WeatherResponse:
 
 
 @app.get(
-    "/api/horoscope",
+    "/dialog/api/horoscope",
     response_model=HoroscopeResponse,
 )
 async def get_horoscope() -> HoroscopeResponse:
@@ -1902,7 +1906,7 @@ async def get_horoscope() -> HoroscopeResponse:
 
 
 @app.get(
-    "/api/dialog/{code}",
+    "/dialog/get/{code}",
     response_model=DialogResponse,
 )
 async def get_dialog(
@@ -1915,7 +1919,7 @@ async def get_dialog(
 
 
 @app.get(
-    "/api/bookmarks/{code}",
+    "/dialog/bookmarks/{code}",
     response_model=BookmarksResponse,
 )
 async def get_bookmarks(
@@ -1929,7 +1933,7 @@ async def get_bookmarks(
 
 
 @app.post(
-    "/api/bookmarks/{code}",
+    "/dialog/bookmarks/{code}",
     response_model=CreateBookmarkResponse,
 )
 async def create_bookmark(
@@ -1994,7 +1998,7 @@ async def create_bookmark(
 
 
 @app.post(
-    "/api/bookmarks/{code}/creator",
+    "/dialog/bookmarks/{code}/creator",
     response_model=BookmarksResponse,
 )
 async def start_creator(
@@ -2009,7 +2013,7 @@ async def start_creator(
 
 
 @app.put(
-    "/api/bookmarks/{code}/{bookmark_id}",
+    "/dialog/bookmarks/{code}/{bookmark_id}",
     response_model=ActivateBookmarkResponse,
 )
 async def activate_bookmark(
@@ -2058,7 +2062,7 @@ async def activate_bookmark(
 
 
 @app.delete(
-    "/api/bookmarks/{code}/{bookmark_id}",
+    "/dialog/bookmarks/{code}/{bookmark_id}",
     response_model=DeleteBookmarkResponse,
 )
 async def delete_bookmark(
@@ -2105,7 +2109,7 @@ async def delete_bookmark(
 
 
 @app.post(
-    "/api/dialog/{code}/messages",
+    "/dialog/messages/{code}",
     response_model=SendMessageResponse,
 )
 async def send_message(
@@ -2211,8 +2215,8 @@ async def send_message(
 
 
 # --------------------------------------------------------------------------
-# Раздача собранного фронтенда (artifacts/dialog/dist/public) тем же процессом.
-# Маршрут регистрируется последним, чтобы не перехватывать /api/* и /docs.
+# Раздача собранного фронтенда (artifacts/dialog-ui/dist/public) тем же процессом.
+# Маршрут регистрируется последним, чтобы не перехватывать остальные /dialog/* /api  и /docs.
 # --------------------------------------------------------------------------
 
 
@@ -2227,16 +2231,8 @@ def _safe_static_path(relative_path: str) -> Path | None:
     return None
 
 
-@app.get("/{full_path:path}", include_in_schema=False)
+@app.get("/dialog/{full_path:path}", include_in_schema=False)
 async def serve_spa(full_path: str) -> FileResponse:
-    index_html = DIALOG_UI_DIST_DIR / "index.html"
-
-    if not index_html.is_file():
-        raise HTTPException(
-            status_code=503,
-            detail="Фронтенд не собран " + index_html,
-        )
-
     static_file = _safe_static_path(full_path)
     if static_file is not None:
         return FileResponse(static_file)
@@ -2247,6 +2243,8 @@ async def serve_spa(full_path: str) -> FileResponse:
 
 
 if __name__ == "__main__":
+    if not index_html.is_file():
+        raise Exception(f"Фронтенд не найден в {index_html}")
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
