@@ -31,7 +31,7 @@ logger = logging.getLogger("dialog")
 
 CODE_RE = re.compile(r"^[A-Za-z0-9]{6}$")
 MAX_PROMPT_WORDS = 500
-BOOKMARK_CREATION_COOLDOWN_SECONDS = 60
+BOOKMARK_CREATION_COOLDOWN_SECONDS = 5
 # Сессия создания собеседника: через это время после нажатия «Добавить нового»
 # режим создания гаснет и агент возвращается к обычному разговору.
 CREATOR_SESSION_TIMEOUT_SECONDS = 15 * 60
@@ -344,7 +344,9 @@ settings = Settings()
 
 class DialogMessage(BaseModel):
     id: str
-    role: Literal["user", "assistant", "system"]
+    # "tool" — результат вызова инструмента (поиска) из трассировки llm-сессии;
+    # пользователь такие сообщения не видит.
+    role: Literal["user", "assistant", "system", "tool"]
     content: str
     created_at: datetime
 
@@ -2034,11 +2036,11 @@ async def activate_bookmark(
                 detail="Такого собеседника нет в этом разговоре.",
             )
 
-        # Клик по любому собеседнику в UI — выход из режима создания
-        # (пользователь ушёл создавать). Программное переключение без флага
-        # (кнопка «Добавить нового» переводит диалог на default, чтобы агент-
-        # создатель вёл общий диалог) режим создания не гасит — см. send_message.
         if ui_action:
+            # Клик по любому собеседнику в UI — выход из режима создания
+            # (пользователь ушёл создавать). Программное переключение без флага
+            # (кнопка «Добавить нового» переводит диалог на default, чтобы агент-
+            # создатель вёл общий диалог) режим создания не гасит — см. send_message.
             state = exit_creator_mode(state, normalized_code)
         next_state = state.model_copy(update={"active_bookmark": target.id})
         thought = await generate_character_thought(normalized_code, next_state)
@@ -2160,7 +2162,7 @@ async def send_message(
             if is_creator_mode:
                 # Общий диалог ведёт агент-создатель: он болтает, уточняет
                 # и создаёт собеседников. Старая история при этом сохраняется.
-                reply, search_trace = await handle_creator_turn(
+                reply, created_bookmark, search_trace = await handle_creator_turn(
                     normalized_code,
                     context,
                     bookmark_state,
