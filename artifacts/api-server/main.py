@@ -231,10 +231,6 @@ CREATOR_SAVED_NOTE = (
     "Готово! Новый собеседник «{name}» появился в списке справа. "
     "Наш прежний разговор никуда не делся — можно вернуться и продолжить."
 )
-CREATOR_SWITCHED_NOTE = (
-    "Собеседник сменился на «{name}». Наш прежний разговор сохранён — "
-    "можно вернуться в любой момент."
-)
 
 SUMMARIZE_FALLBACK_PROMPT = """Ты ведёшь краткую сводку давней части разговора между человеком и его собеседником.
 Тебе дают предыдущую сводку (если она была) и новую часть диалога. Обнови сводку так,
@@ -1362,22 +1358,6 @@ def trimmed_llm_for_summary(
     return llm_messages
 
 
-def to_llm_messages(
-    messages: list[DialogMessage],
-    system_prompt: str,
-    summary: DialogSummary | None = None,
-) -> list[dict[str, str]]:
-    # На вход приходит уже очищенная llm-копия (см. cleaned_llm_history);
-    # trim_window — последний предохранитель от аномально длинной сессии.
-    return [
-        {"role": "system", "content": build_system_prompt(system_prompt, summary)},
-        *[
-            {"role": message.role, "content": message.content}
-            for message in trim_window(messages)
-        ],
-    ]
-
-
 def _summary_entry_text(entry: DialogSummary) -> str:
     updated = entry.updated_at.astimezone(UTC).strftime("%d.%m.%Y")
     return f"Краткое содержание более ранней части разговора (по {updated}):\n{entry.text.strip()}"
@@ -1789,6 +1769,12 @@ async def handle_creator_turn(
     # Персонаж готов: гасим режим создания и сразу переключаемся на него,
     # чтобы продолжить разговор уже новым собеседником.
     exit_creator_mode(state, normalized_code)
+    # Перезачитываем bookmarks.json: список мог измениться за время LLM-вызова
+    # (сессии обслуживаются конкурентно). Иначе можно перезаписать чужие
+    # изменения. active_bookmark переключаем на созданного собеседника.
+    state = store.load_bookmarks(normalized_code)
+    if all(existing.id != bookmark.id for existing in state.bookmarks):
+        state.bookmarks.append(bookmark)
     state.active_bookmark = bookmark.id
     store.save_bookmarks(normalized_code, state)
     return (
@@ -2045,16 +2031,6 @@ async def activate_bookmark(
         next_state = state.model_copy(update={"active_bookmark": target.id})
         thought = await generate_character_thought(normalized_code, next_state)
         messages = store.load_actor_history(normalized_code, target.id)
-        if state.active_bookmark != target.id and target.id != DEFAULT_BOOKMARK_ID:
-            messages.append(
-                DialogMessage(
-                    id=f"system-{datetime.now(UTC).timestamp()}",
-                    role="system",
-                    content=CREATOR_SWITCHED_NOTE.format(name=target.name),
-                    created_at=datetime.now(UTC),
-                )
-            )
-            store.save_actor_history(normalized_code, target.id, messages)
         store.save_bookmarks(normalized_code, next_state)
 
     return ActivateBookmarkResponse(
@@ -2186,9 +2162,14 @@ async def send_message(
             content=reply,
             created_at=datetime.now(UTC),
         )
-        updated_messages = [*context, assistant_message]
         if created_bookmark is not None:
-            updated_messages.append(
+            # Собеседник создан: ход (просьба, ответ «Готово!...» и трассировка
+            # поиска) становится началом истории нового собеседника — разговор
+            # сразу продолжается с ним. Прежний диалог не трогаем: он остаётся
+            # в истории default, а в ответе уходит только новый ход.
+            bookmark_id = created_bookmark.id
+            updated_messages = [
+                assistant_message,
                 DialogMessage(
                     id=f"system-{datetime.now(UTC).timestamp()}",
                     role="system",
@@ -2197,11 +2178,15 @@ async def send_message(
                         "можно вернуться в любой момент."
                     ),
                     created_at=datetime.now(UTC),
-                )
-            )
+                ),
+            ]
+        else:
+            updated_messages = [*context, assistant_message]
         store.save_actor_history(normalized_code, bookmark_id, updated_messages)
 
     # Сжатие llm-сессии — фоном, вне блокировки: живой диалог не ждёт LLM.
+    # bookmark_id к этому моменту уже указывает на созданного собеседника,
+    # если этот ход был ходом создания.
     asyncio.create_task(
         compress_llm_session_after_save(
             normalized_code, bookmark_id, updated_messages, search_trace
