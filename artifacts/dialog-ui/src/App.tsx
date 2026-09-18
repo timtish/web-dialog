@@ -10,7 +10,7 @@ import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
-import { Route, Switch, useLocation, useRoute, Router as WouterRouter } from 'wouter';
+import { Route, Switch, useLocation, useRoute, useParams, Router as WouterRouter } from 'wouter';
 
 type Role = 'assistant' | 'user' | 'system';
 
@@ -190,8 +190,8 @@ function fromApiMessages(messages: ApiMessage[]): Message[] {
 }
 
 function Home() {
-  const [, routeParams] = useRoute('/dialog/:code');
-  const code = (routeParams?.code ?? 'demo01').toLowerCase();
+  const params = useParams();
+  const code = (params?.code ?? 'demo01').toLowerCase();
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState('');
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
